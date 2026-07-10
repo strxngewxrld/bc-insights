@@ -1,0 +1,63 @@
+# OpenTelemetry Collector configuration for the Business Central telemetry proxy.
+#
+# Role: central egress to GitLab Observability. It receives translated telemetry
+# from the C# proxy over OTLP, reads the Windows Event Log, and forwards
+# everything to a self-managed GitLab Observability instance (GitLab 18.1+).
+#
+# Requires the *contrib* distribution (otelcol-contrib) because of the
+# windowseventlog receiver. Set GITLAB_OTLP_ENDPOINT before starting the service.
+
+receivers:
+  # Telemetry translated by the BC proxy (BC traces/messages, requests,
+  # dependencies, exceptions, metrics).
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+      grpc:
+        endpoint: 127.0.0.1:4317
+
+  # Windows Event Log -> OTLP logs, so eventlog entries also show up in GitLab.
+  windowseventlog/system:
+    channel: System
+  windowseventlog/application:
+    channel: Application
+
+processors:
+  batch:
+    timeout: 5s
+  # Tag everything so it is filterable in the GitLab Observability UI.
+  resource:
+    attributes:
+      - key: service.namespace
+        value: business-central
+        action: upsert
+
+exporters:
+  # Self-managed GitLab Observability exposes standard OTLP on port 4318 (HTTP).
+  # The exporter appends /v1/traces, /v1/logs and /v1/metrics automatically.
+  otlphttp/gitlab:
+    endpoint: ${env:GITLAB_OTLP_ENDPOINT} # e.g. http://gitlab-observability.example.com:4318
+    # For project-scoped GitLab ingestion that requires a token, uncomment:
+    # headers:
+    #   PRIVATE-TOKEN: ${env:GITLAB_TOKEN}
+    tls:
+      insecure: true # set to false and configure ca_file for HTTPS endpoints
+  # Handy while validating locally: prints exported telemetry to the console.
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/gitlab]
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/gitlab]
+    logs:
+      receivers: [otlp, windowseventlog/system, windowseventlog/application]
+      processors: [resource, batch]
+      exporters: [otlphttp/gitlab]
