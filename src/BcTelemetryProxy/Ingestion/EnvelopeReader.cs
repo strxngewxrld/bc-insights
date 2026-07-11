@@ -1,14 +1,40 @@
 using System.IO.Compression;
+using System.Text;
 using System.Text.Json;
+using BcTelemetryProxy.Configuration;
 using BcTelemetryProxy.Model;
 
 namespace BcTelemetryProxy.Ingestion;
 
+/// <summary>Overall outcome of reading a request body.</summary>
+public enum ReadOutcome
+{
+    Ok,
+    InvalidGzip,
+    CompressedLimitExceeded,
+    DecompressedLimitExceeded,
+    TooManyEnvelopes,
+}
+
+/// <summary>Per-envelope parse status.</summary>
+public enum EnvelopeItemStatus
+{
+    Parsed,
+    Malformed,
+    TooLarge,
+}
+
+public sealed record EnvelopeReadItem(int Index, Envelope? Envelope, EnvelopeItemStatus Status);
+
+public sealed record EnvelopeReadResult(ReadOutcome Outcome, IReadOnlyList<EnvelopeReadItem> Items);
+
 /// <summary>
-/// Reads an Application Insights ingestion request body. The body is
-/// newline-delimited JSON (NDJSON), one <see cref="Envelope"/> per line, and is
-/// usually gzip-compressed (Content-Encoding: gzip). Business Central also uses
-/// <c>application/x-json-stream</c> as the content type.
+/// Reads an Application Insights ingestion request body (NDJSON, one
+/// <see cref="Envelope"/> per line, usually gzip-compressed) while enforcing the
+/// configured size and count limits. Never throws on malformed content: each
+/// line is reported with its status so the caller can build a partial-success
+/// response, and request-level limit breaches are returned as an
+/// <see cref="ReadOutcome"/> rather than an exception.
 /// </summary>
 public static class EnvelopeReader
 {
@@ -17,22 +43,22 @@ public static class EnvelopeReader
         PropertyNameCaseInsensitive = true,
     };
 
-    /// <summary>
-    /// Reads and parses all envelopes from the request stream. Malformed lines
-    /// are skipped and reported via <paramref name="malformedLines"/> so the
-    /// caller can build an Application-Insights-style partial-success response.
-    /// </summary>
-    public static async Task<IReadOnlyList<Envelope>> ReadAsync(
+    public static async Task<EnvelopeReadResult> ReadAsync(
         Stream body,
         bool gzip,
+        IngestionOptions options,
         CancellationToken cancellationToken = default)
     {
-        var stream = gzip ? new GZipStream(body, CompressionMode.Decompress) : body;
-        var envelopes = new List<Envelope>();
+        var items = new List<EnvelopeReadItem>();
+
+        var compressedLimited = new LimitingStream(body, options.MaxCompressedRequestBytes);
+        Stream payload = gzip ? new GZipStream(compressedLimited, CompressionMode.Decompress) : compressedLimited;
+        var decompressedLimited = new LimitingStream(payload, options.MaxDecompressedRequestBytes);
 
         try
         {
-            using var reader = new StreamReader(stream, leaveOpen: !gzip);
+            using var reader = new StreamReader(decompressedLimited, Encoding.UTF8);
+            var index = 0;
             string? line;
             while ((line = await reader.ReadLineAsync(cancellationToken)) is not null)
             {
@@ -41,31 +67,55 @@ public static class EnvelopeReader
                     continue;
                 }
 
-                Envelope? envelope;
-                try
+                if (items.Count >= options.MaxEnvelopesPerRequest)
                 {
-                    envelope = JsonSerializer.Deserialize<Envelope>(line, JsonOptions);
+                    return new EnvelopeReadResult(ReadOutcome.TooManyEnvelopes, items);
                 }
-                catch (JsonException)
+
+                if (Encoding.UTF8.GetByteCount(line) > options.MaxEnvelopeBytes)
                 {
-                    // Skip a single malformed line rather than failing the batch.
+                    items.Add(new EnvelopeReadItem(index++, null, EnvelopeItemStatus.TooLarge));
                     continue;
                 }
 
-                if (envelope is not null)
-                {
-                    envelopes.Add(envelope);
-                }
+                items.Add(ParseLine(line, index++));
             }
+        }
+        catch (StreamLimitExceededException ex)
+        {
+            var outcome = ex.Limit == options.MaxCompressedRequestBytes
+                ? ReadOutcome.CompressedLimitExceeded
+                : ReadOutcome.DecompressedLimitExceeded;
+            return new EnvelopeReadResult(outcome, items);
+        }
+        catch (InvalidDataException)
+        {
+            // Corrupt gzip stream.
+            return new EnvelopeReadResult(ReadOutcome.InvalidGzip, items);
         }
         finally
         {
             if (gzip)
             {
-                await stream.DisposeAsync();
+                await payload.DisposeAsync();
             }
         }
 
-        return envelopes;
+        return new EnvelopeReadResult(ReadOutcome.Ok, items);
+    }
+
+    private static EnvelopeReadItem ParseLine(string line, int index)
+    {
+        try
+        {
+            var envelope = JsonSerializer.Deserialize<Envelope>(line, JsonOptions);
+            return envelope is not null
+                ? new EnvelopeReadItem(index, envelope, EnvelopeItemStatus.Parsed)
+                : new EnvelopeReadItem(index, null, EnvelopeItemStatus.Malformed);
+        }
+        catch (JsonException)
+        {
+            return new EnvelopeReadItem(index, null, EnvelopeItemStatus.Malformed);
+        }
     }
 }

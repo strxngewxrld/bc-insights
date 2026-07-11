@@ -5,18 +5,23 @@
     config.yaml in this folder. The contrib build is required for the
     windowseventlog receiver.
 
-.PARAMETER GitLabOtlpEndpoint
-    OTLP/HTTP endpoint of the self-managed GitLab Observability instance,
-    e.g. http://gitlab-observability.example.com:4318
+.PARAMETER OtlpExportEndpoint
+    OTLP/HTTP endpoint of the observability backend the Collector forwards to,
+    e.g. https://observability.example.com:4318 (any OTLP-capable backend).
+
+.PARAMETER OtlpExportToken
+    Optional bearer/authorization token for the backend. When set, uncomment the
+    matching headers block in config.yaml.
 
 .PARAMETER Version
     otelcol-contrib release to download.
 
 .EXAMPLE
-    .\Install-Collector.ps1 -GitLabOtlpEndpoint "http://gitlab-observability.example.com:4318"
+    .\Install-Collector.ps1 -OtlpExportEndpoint "https://observability.example.com:4318"
 #>
 param(
-    [Parameter(Mandatory = $true)][string]$GitLabOtlpEndpoint,
+    [Parameter(Mandatory = $true)][string]$OtlpExportEndpoint,
+    [string]$OtlpExportToken,
     [string]$Version = "0.116.0",
     [string]$InstallDir = "C:\Program Files\otelcol-contrib"
 )
@@ -39,8 +44,11 @@ if (-not (Test-Path $exe)) {
 
 Copy-Item -Path (Join-Path $PSScriptRoot "config.yaml") -Destination $configTarget -Force
 
-# Persist the GitLab endpoint as a machine environment variable the service reads.
-[Environment]::SetEnvironmentVariable("GITLAB_OTLP_ENDPOINT", $GitLabOtlpEndpoint, "Machine")
+# Persist backend settings as machine environment variables the service reads.
+[Environment]::SetEnvironmentVariable("OTLP_EXPORT_ENDPOINT", $OtlpExportEndpoint, "Machine")
+if ($OtlpExportToken) {
+    [Environment]::SetEnvironmentVariable("OTLP_EXPORT_TOKEN", $OtlpExportToken, "Machine")
+}
 
 $serviceName = "otelcol-contrib"
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
@@ -50,7 +58,7 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 }
 
 sc.exe create $serviceName binPath= "`"$exe`" --config `"$configTarget`"" start= auto | Out-Null
-sc.exe description $serviceName "OpenTelemetry Collector - Business Central telemetry to GitLab" | Out-Null
+sc.exe description $serviceName "OpenTelemetry Collector - Business Central telemetry egress" | Out-Null
 Start-Service $serviceName
 
-Write-Host "Collector installed and started. Endpoint: $GitLabOtlpEndpoint"
+Write-Host "Collector installed and started. Export endpoint: $OtlpExportEndpoint"

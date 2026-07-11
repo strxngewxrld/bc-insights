@@ -1,15 +1,15 @@
 # OpenTelemetry Collector configuration for the Business Central telemetry proxy.
 #
-# Role: central egress to GitLab Observability. It receives translated telemetry
-# from the C# proxy over OTLP, reads the Windows Event Log, and forwards
-# everything to a self-managed GitLab Observability instance (GitLab 18.1+).
+# Role: central, backend-neutral egress. It receives translated telemetry from
+# the C# proxy over OTLP, reads selected Windows Event Log providers, and
+# forwards everything to an OTLP-capable observability backend.
 #
-# Requires the *contrib* distribution (otelcol-contrib) because of the
-# windowseventlog receiver. Set GITLAB_OTLP_ENDPOINT before starting the service.
+# The proxy itself is backend-agnostic: the choice of backend lives here, in the
+# exporter. Requires the *contrib* distribution (otelcol-contrib) for the
+# windowseventlog receiver. Set OTLP_EXPORT_ENDPOINT before starting the service.
 
 receivers:
-  # Telemetry translated by the BC proxy (BC traces/messages, requests,
-  # dependencies, exceptions, metrics).
+  # Telemetry translated by the BC proxy.
   otlp:
     protocols:
       http:
@@ -17,32 +17,58 @@ receivers:
       grpc:
         endpoint: 127.0.0.1:4317
 
-  # Windows Event Log -> OTLP logs, so eventlog entries also show up in GitLab.
-  windowseventlog/system:
-    channel: System
+  # Windows Event Log -> OTLP logs. Scoped to providers relevant to this use case
+  # instead of shipping the whole System/Application channels. Narrow further with
+  # explicit event ids via the query attribute if needed.
   windowseventlog/application:
     channel: Application
+    # Only events from BC-relevant providers.
+    query: |
+      *[System[Provider[
+        @Name='Microsoft Dynamics 365 Business Central Server' or
+        @Name='.NET Runtime' or
+        @Name='IIS AspNetCore Module V2' or
+        @Name='BcTelemetryProxy'
+      ]]]
+  windowseventlog/system:
+    channel: System
+    # System channel restricted to warnings and errors (Level 1=Critical..3=Warning).
+    query: |
+      *[System[(Level=1 or Level=2 or Level=3)]]
 
 processors:
   batch:
     timeout: 5s
-  # Tag everything so it is filterable in the GitLab Observability UI.
+    send_batch_size: 8192
+    send_batch_max_size: 16384
   resource:
     attributes:
       - key: service.namespace
-        value: business-central
+        value: dynamics365-bc
         action: upsert
 
 exporters:
-  # Self-managed GitLab Observability exposes standard OTLP on port 4318 (HTTP).
-  # The exporter appends /v1/traces, /v1/logs and /v1/metrics automatically.
-  otlphttp/gitlab:
-    endpoint: ${env:GITLAB_OTLP_ENDPOINT} # e.g. http://gitlab-observability.example.com:4318
-    # For project-scoped GitLab ingestion that requires a token, uncomment:
+  # Backend-neutral OTLP/HTTP exporter. Point OTLP_EXPORT_ENDPOINT at any
+  # OTLP-capable backend (GitLab Observability, Grafana/Tempo/Loki, Jaeger,
+  # a vendor endpoint, ...). See docs/deployment.md for backend examples.
+  otlphttp/backend:
+    endpoint: ${env:OTLP_EXPORT_ENDPOINT}
+    # Secure by default: TLS verification stays on. For a token-authenticated
+    # backend, add the header it expects, e.g.:
     # headers:
-    #   PRIVATE-TOKEN: ${env:GITLAB_TOKEN}
+    #   Authorization: ${env:OTLP_EXPORT_TOKEN}
     tls:
-      insecure: true # set to false and configure ca_file for HTTPS endpoints
+      insecure: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 5000
+
   # Handy while validating locally: prints exported telemetry to the console.
   debug:
     verbosity: normal
@@ -52,12 +78,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [resource, batch]
-      exporters: [otlphttp/gitlab]
+      exporters: [otlphttp/backend]
     metrics:
       receivers: [otlp]
       processors: [resource, batch]
-      exporters: [otlphttp/gitlab]
+      exporters: [otlphttp/backend]
     logs:
-      receivers: [otlp, windowseventlog/system, windowseventlog/application]
+      receivers: [otlp, windowseventlog/application, windowseventlog/system]
       processors: [resource, batch]
-      exporters: [otlphttp/gitlab]
+      exporters: [otlphttp/backend]

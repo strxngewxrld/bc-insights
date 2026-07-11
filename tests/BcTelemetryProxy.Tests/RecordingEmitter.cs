@@ -30,8 +30,8 @@ public sealed class RecordingEmitter : IOtelEmitter
         IReadOnlyList<KeyValuePair<string, object?>> tags)
         => Spans.Add(new SpanEntry(name, kind, startUtc, duration, traceId, parentSpanId, success, statusDescription, ToDict(tags)));
 
-    public void EmitMetric(string name, double value, IReadOnlyList<KeyValuePair<string, object?>> tags)
-        => Metrics.Add(new MetricEntry(name, value, ToDict(tags)));
+    public void EmitMetric(AiMetricPoint point, MetricKind kind, IReadOnlyList<KeyValuePair<string, object?>> tags)
+        => Metrics.Add(new MetricEntry(point, kind, ToDict(tags)));
 
     private static Dictionary<string, object?> ToDict(IReadOnlyList<KeyValuePair<string, object?>> pairs)
     {
@@ -57,5 +57,5 @@ public sealed class RecordingEmitter : IOtelEmitter
         string? StatusDescription,
         Dictionary<string, object?> Tags);
 
-    public sealed record MetricEntry(string Name, double Value, Dictionary<string, object?> Tags);
+    public sealed record MetricEntry(AiMetricPoint Point, MetricKind Kind, Dictionary<string, object?> Tags);
 }

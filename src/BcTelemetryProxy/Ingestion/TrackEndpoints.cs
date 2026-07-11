@@ -1,4 +1,6 @@
+using BcTelemetryProxy.Configuration;
 using BcTelemetryProxy.Mapping;
+using Microsoft.Extensions.Options;
 
 namespace BcTelemetryProxy.Ingestion;
 
@@ -10,11 +12,9 @@ public static class TrackEndpoints
 {
     public static void MapAppInsightsIngestion(this WebApplication app)
     {
-        // The real ingestion endpoints BC posts telemetry to.
         app.MapPost("/v2/track", HandleTrackAsync);
         app.MapPost("/v2.1/track", HandleTrackAsync);
 
-        // Health probe for load balancers / smoke tests.
         app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
         // Any other AI control endpoint (Live Metrics/QuickPulse, ping, profile
@@ -27,30 +27,89 @@ public static class TrackEndpoints
     private static async Task<IResult> HandleTrackAsync(
         HttpContext context,
         AiToOtelMapper mapper,
+        IOptions<IngestionOptions> ingestionOptions,
         ILogger<AiToOtelMapper> logger)
     {
+        var options = ingestionOptions.Value;
+
+        // Reject early when the declared compressed size is already too large.
+        if (context.Request.ContentLength is { } length && length > options.MaxCompressedRequestBytes)
+        {
+            return PayloadTooLarge("Compressed request exceeds the configured limit.");
+        }
+
         var gzip = context.Request.Headers.ContentEncoding
             .Any(v => v is not null && v.Contains("gzip", StringComparison.OrdinalIgnoreCase));
 
-        var envelopes = await EnvelopeReader.ReadAsync(context.Request.Body, gzip, context.RequestAborted);
+        EnvelopeReadResult read;
+        try
+        {
+            read = await EnvelopeReader.ReadAsync(context.Request.Body, gzip, options, context.RequestAborted);
+        }
+        catch (Exception ex)
+        {
+            // A faulty payload must never crash the process.
+            logger.LogWarning(ex, "Failed to read ingestion request body");
+            return Results.BadRequest(new IngestionResponse(0, 0)
+            {
+                errors = new object[] { new IngestionError(0, 400, "Malformed request body.") },
+            });
+        }
+
+        switch (read.Outcome)
+        {
+            case ReadOutcome.CompressedLimitExceeded:
+                return PayloadTooLarge("Compressed request exceeds the configured limit.");
+            case ReadOutcome.DecompressedLimitExceeded:
+                return PayloadTooLarge("Decompressed payload exceeds the configured limit.");
+            case ReadOutcome.TooManyEnvelopes:
+                return PayloadTooLarge("Too many envelopes in a single request.");
+            case ReadOutcome.InvalidGzip:
+                return Results.BadRequest(new IngestionResponse(0, 0)
+                {
+                    errors = new object[] { new IngestionError(0, 400, "Invalid gzip payload.") },
+                });
+        }
 
         var accepted = 0;
-        foreach (var envelope in envelopes)
+        var errors = new List<object>();
+        foreach (var item in read.Items)
         {
-            try
+            switch (item.Status)
             {
-                mapper.Map(envelope);
-                accepted++;
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Failed to translate BC telemetry envelope {Name}", envelope.Name);
+                case EnvelopeItemStatus.Malformed:
+                    errors.Add(new IngestionError(item.Index, 400, "Envelope could not be parsed."));
+                    break;
+                case EnvelopeItemStatus.TooLarge:
+                    errors.Add(new IngestionError(item.Index, 413, "Envelope exceeds the configured size limit."));
+                    break;
+                case EnvelopeItemStatus.Parsed:
+                    switch (mapper.Map(item.Envelope!))
+                    {
+                        case MappingStatus.Mapped:
+                        case MappingStatus.Unsupported:
+                            // Both are forwarded; unsupported types are flagged and counted.
+                            accepted++;
+                            break;
+                        case MappingStatus.Failed:
+                            errors.Add(new IngestionError(item.Index, 400, "Envelope could not be translated."));
+                            break;
+                    }
+
+                    break;
             }
         }
 
-        // Application Insights returns 200 with an ingestion summary.
-        return Results.Ok(new IngestionResponse(envelopes.Count, accepted));
+        var response = new IngestionResponse(read.Items.Count, accepted) { errors = errors.ToArray() };
+        return errors.Count > 0
+            ? Results.Json(response, statusCode: StatusCodes.Status206PartialContent)
+            : Results.Ok(response);
     }
+
+    private static IResult PayloadTooLarge(string message)
+        => Results.Json(
+            new IngestionResponse(0, 0) { errors = new object[] { new IngestionError(0, 413, message) } },
+            statusCode: StatusCodes.Status413PayloadTooLarge);
 }
 
 /// <summary>Application-Insights-compatible ingestion response body.</summary>
@@ -58,3 +117,6 @@ public sealed record IngestionResponse(int itemsReceived, int itemsAccepted)
 {
     public object[] errors { get; init; } = Array.Empty<object>();
 }
+
+/// <summary>Per-item error, correlated to the envelope index within the batch.</summary>
+public sealed record IngestionError(int index, int statusCode, string message);

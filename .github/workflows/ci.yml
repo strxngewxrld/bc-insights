@@ -19,8 +19,24 @@ jobs:
       - name: Restore
         run: dotnet restore
 
-      - name: Build
-        run: dotnet build --no-restore -c Release
+      - name: Format check
+        run: dotnet format --verify-no-changes
 
-      - name: Test
-        run: dotnet test --no-build -c Release --verbosity normal
+      - name: Build
+        run: dotnet build --no-restore -c Release -warnaserror
+
+      - name: Unit tests
+        run: dotnet test --no-build -c Release --filter "FullyQualifiedName!~IngestionEndpointTests"
+
+      - name: Integration tests
+        run: dotnet test --no-build -c Release --filter "FullyQualifiedName~IngestionEndpointTests"
+
+      - name: Dependency vulnerability check
+        run: |
+          echo "Scanning for vulnerable packages (including transitive)…"
+          output=$(dotnet list package --vulnerable --include-transitive 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "has the following vulnerable"; then
+            echo "::error::Vulnerable packages detected"
+            exit 1
+          fi
