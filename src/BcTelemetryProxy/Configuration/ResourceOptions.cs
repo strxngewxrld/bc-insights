@@ -1,8 +1,9 @@
 namespace BcTelemetryProxy.Configuration;
 
 /// <summary>
-/// Proxy-level resource attributes describing the Business Central environment
-/// this proxy fronts. Null values fall back to sensible machine defaults.
+/// Defaults for the OTLP resource of each telemetry source, plus per-source
+/// overrides. A source is identified by host and BC server instance (from the
+/// ingestion URL, the envelope, or the defaults below).
 /// </summary>
 public sealed class ResourceOptions
 {
@@ -12,13 +13,24 @@ public sealed class ResourceOptions
 
     public string ServiceNamespace { get; set; } = "dynamics365-bc";
 
-    public string? ServiceInstanceId { get; set; }
-
     public string? DeploymentEnvironment { get; set; } = "production";
 
+    /// <summary>Host name used when neither the URL nor the envelope provides one.</summary>
     public string? HostName { get; set; }
 
+    /// <summary>BC server instance used when the ingestion URL does not name one.</summary>
     public string? BcServerInstance { get; set; }
 
-    public string? BcTenantId { get; set; }
+    /// <summary>
+    /// Per-source overrides keyed by <c>host/instance</c>, <c>instance</c> or
+    /// <c>host</c> (case-insensitive, most specific match wins).
+    /// </summary>
+    public Dictionary<string, SourceOverride> Sources { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed class SourceOverride
+{
+    public string? ServiceName { get; set; }
+
+    public string? DeploymentEnvironment { get; set; }
 }

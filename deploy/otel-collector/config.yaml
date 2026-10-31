@@ -1,11 +1,12 @@
 # OpenTelemetry Collector configuration for the Business Central telemetry proxy.
 #
-# Role: central, backend-neutral egress. It receives translated telemetry from
-# the C# proxy over OTLP, reads selected Windows Event Log providers, and
-# forwards everything to an OTLP-capable observability backend.
+# OPTIONAL. The proxy exports directly to the backend by default. Use this
+# Collector only to add Windows Event Logs or fan out to several backends; then
+# point the proxy's Otlp:Endpoint at http://localhost:4318.
 #
-# The proxy itself is backend-agnostic: the choice of backend lives here, in the
-# exporter. Requires the *contrib* distribution (otelcol-contrib) for the
+# It receives translated telemetry from the proxy over OTLP, reads selected
+# Windows Event Log providers, and forwards everything to an OTLP-capable
+# backend. Requires the *contrib* distribution (otelcol-contrib) for the
 # windowseventlog receiver. Set OTLP_EXPORT_ENDPOINT before starting the service.
 
 receivers:

@@ -48,7 +48,7 @@ public class AiToOtelMapperTests
         Assert.Equal(TimeSpan.FromMilliseconds(456), span.Duration);
         Assert.True(span.Success);
         Assert.Equal("0123456789abcdef0123456789abcdef", span.TraceId.ToHexString());
-        Assert.Equal("200", span.Tags["http.response.status_code"]);
+        Assert.Equal(200L, span.Tags["http.response.status_code"]);
         Assert.Equal("al://page/22", span.Tags["url.full"]);
     }
 

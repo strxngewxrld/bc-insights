@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using BcTelemetryProxy.Mapping;
+using BcTelemetryProxy.Model;
 using Microsoft.Extensions.Logging;
 
 namespace BcTelemetryProxy.Tests;
@@ -11,27 +12,15 @@ public sealed class RecordingEmitter : IOtelEmitter
     public List<SpanEntry> Spans { get; } = new();
     public List<MetricEntry> Metrics { get; } = new();
 
-    public void EmitLog(
-        LogLevel level,
-        string? body,
-        string? eventName,
-        IReadOnlyList<KeyValuePair<string, object?>> attributes)
-        => Logs.Add(new LogEntry(level, body, eventName, ToDict(attributes)));
+    public void EmitLog(LogItem log)
+        => Logs.Add(new LogEntry(log.Level, log.Body, log.EventName, ToDict(log.Attributes), log));
 
-    public void EmitSpan(
-        string name,
-        ActivityKind kind,
-        DateTime startUtc,
-        TimeSpan duration,
-        ActivityTraceId traceId,
-        ActivitySpanId? parentSpanId,
-        bool success,
-        string? statusDescription,
-        IReadOnlyList<KeyValuePair<string, object?>> tags)
-        => Spans.Add(new SpanEntry(name, kind, startUtc, duration, traceId, parentSpanId, success, statusDescription, ToDict(tags)));
+    public void EmitSpan(SpanItem span)
+        => Spans.Add(new SpanEntry(span.Name, span.Kind, span.StartUtc, span.Duration, span.TraceId, span.ParentSpanId,
+            span.Success, span.StatusDescription, ToDict(span.Attributes), span));
 
-    public void EmitMetric(AiMetricPoint point, MetricKind kind, IReadOnlyList<KeyValuePair<string, object?>> tags)
-        => Metrics.Add(new MetricEntry(point, kind, ToDict(tags)));
+    public void EmitMetric(MetricItem metric)
+        => Metrics.Add(new MetricEntry(metric.Point, metric.Kind, ToDict(metric.Attributes), metric));
 
     private static Dictionary<string, object?> ToDict(IReadOnlyList<KeyValuePair<string, object?>> pairs)
     {
@@ -44,7 +33,7 @@ public sealed class RecordingEmitter : IOtelEmitter
         return dict;
     }
 
-    public sealed record LogEntry(LogLevel Level, string? Body, string? EventName, Dictionary<string, object?> Attributes);
+    public sealed record LogEntry(LogLevel Level, string? Body, string? EventName, Dictionary<string, object?> Attributes, LogItem Item);
 
     public sealed record SpanEntry(
         string Name,
@@ -55,7 +44,8 @@ public sealed class RecordingEmitter : IOtelEmitter
         ActivitySpanId? ParentSpanId,
         bool Success,
         string? StatusDescription,
-        Dictionary<string, object?> Tags);
+        Dictionary<string, object?> Tags,
+        SpanItem Item);
 
-    public sealed record MetricEntry(AiMetricPoint Point, MetricKind Kind, Dictionary<string, object?> Tags);
+    public sealed record MetricEntry(AiMetricPoint Point, MetricKind Kind, Dictionary<string, object?> Tags, MetricItem Item);
 }

@@ -81,5 +81,33 @@ public class IngestionEndpointTests : IClassFixture<WebApplicationFactory<Progra
     {
         var response = await _factory.CreateClient().GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.True(doc.RootElement.TryGetProperty("queueLength", out _));
+    }
+
+    [Theory]
+    [InlineData("/SRV01/BC290/v2/track")]
+    [InlineData("/BC290/v2.1/track")]
+    public async Task Source_prefixed_routes_are_accepted(string path)
+    {
+        using var content = new StringContent(Message, Encoding.UTF8);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/x-json-stream");
+
+        var response = await _factory.CreateClient().PostAsync(path, content);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal(1, doc.RootElement.GetProperty("itemsAccepted").GetInt32());
+    }
+
+    [Fact]
+    public async Task Invalid_source_segment_is_rejected()
+    {
+        using var content = new StringContent(Message, Encoding.UTF8);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/x-json-stream");
+
+        var response = await _factory.CreateClient().PostAsync("/SRV%2001/BC290/v2/track", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 }

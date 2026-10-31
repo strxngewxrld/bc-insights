@@ -1,4 +1,5 @@
-using BcTelemetryProxy.Configuration;
+﻿using BcTelemetryProxy.Configuration;
+using BcTelemetryProxy.Export;
 using BcTelemetryProxy.Mapping;
 using Microsoft.Extensions.Options;
 
@@ -12,10 +13,30 @@ public static class TrackEndpoints
 {
     public static void MapAppInsightsIngestion(this WebApplication app)
     {
-        app.MapPost("/v2/track", HandleTrackAsync);
-        app.MapPost("/v2.1/track", HandleTrackAsync);
+        // The optional {host}/{instance} prefix identifies the sending BC server
+        // instance; it comes from the IngestionEndpoint in BC's connection string,
+        // e.g. https://proxy/SRV01/BC290/ -> POST /SRV01/BC290/v2/track.
+        foreach (var prefix in new[] { "", "/{instance}", "/{host}/{instance}" })
+        {
+            app.MapPost(prefix + "/v2/track", HandleTrackAsync);
+            app.MapPost(prefix + "/v2.1/track", HandleTrackAsync);
+        }
 
-        app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+        app.MapGet("/health", (OtlpExporter exporter) =>
+        {
+            var s = exporter.Statistics;
+            return Results.Ok(new
+            {
+                status = s.LastSuccessUtc is null && s.LastError is not null ? "degraded" : "ok",
+                queueLength = exporter.QueueLength,
+                exported = new { logs = s.ExportedLogs, spans = s.ExportedSpans, metrics = s.ExportedMetrics },
+                dropped = s.Dropped,
+                failed = s.Failed,
+                rejected = s.Rejected,
+                lastSuccessUtc = s.LastSuccessUtc,
+                lastError = s.LastError,
+            });
+        });
 
         // Any other AI control endpoint (Live Metrics/QuickPulse, ping, profile
         // lookups) is answered with 200 so the BC telemetry client does not log
@@ -27,10 +48,23 @@ public static class TrackEndpoints
     private static async Task<IResult> HandleTrackAsync(
         HttpContext context,
         AiToOtelMapper mapper,
+        SourceResolver sources,
+        OtlpExporter exporter,
         IOptions<IngestionOptions> ingestionOptions,
         ILogger<AiToOtelMapper> logger)
     {
         var options = ingestionOptions.Value;
+
+        var routeHost = context.Request.RouteValues["host"] as string;
+        var routeInstance = context.Request.RouteValues["instance"] as string;
+        if ((routeHost is not null && !SourceResolver.IsValidSegment(routeHost)) ||
+            (routeInstance is not null && !SourceResolver.IsValidSegment(routeInstance)))
+        {
+            return Results.BadRequest(new IngestionResponse(0, 0)
+            {
+                errors = new object[] { new IngestionError(0, 400, "Invalid host or instance in the URL.") },
+            });
+        }
 
         // Reject early when the declared compressed size is already too large.
         if (context.Request.ContentLength is { } length && length > options.MaxCompressedRequestBytes)
@@ -71,6 +105,20 @@ public static class TrackEndpoints
                 });
         }
 
+        // Backpressure: if the export queue cannot take the batch, let BC keep it
+        // and retry later (503 is retryable for the Application Insights client).
+        if (!exporter.HasCapacity(read.Items.Count))
+        {
+            logger.LogWarning("Export queue full; refusing {Count} envelope(s) with 503", read.Items.Count);
+            return Results.Json(
+                new IngestionResponse(read.Items.Count, 0)
+                {
+                    errors = read.Items.Select(i => (object)new IngestionError(i.Index, 503, "Proxy export queue is full.")).ToArray(),
+                },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        var caller = context.Connection.RemoteIpAddress;
         var accepted = 0;
         var errors = new List<object>();
         foreach (var item in read.Items)
@@ -84,7 +132,8 @@ public static class TrackEndpoints
                     errors.Add(new IngestionError(item.Index, 413, "Envelope exceeds the configured size limit."));
                     break;
                 case EnvelopeItemStatus.Parsed:
-                    switch (mapper.Map(item.Envelope!))
+                    var source = sources.Resolve(routeHost, routeInstance, item.Envelope!, caller);
+                    switch (mapper.Map(item.Envelope!, source))
                     {
                         case MappingStatus.Mapped:
                         case MappingStatus.Unsupported:

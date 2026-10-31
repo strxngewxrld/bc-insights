@@ -6,21 +6,22 @@
 
 .DESCRIPTION
     Business Central's Application Insights connection string should then point
-    its IngestionEndpoint at this site, e.g.:
-        InstrumentationKey=<any-guid>;IngestionEndpoint=https://bcproxy.example.com/
+    its IngestionEndpoint at this site, naming the BC host and server instance in
+    the path so several instances and servers can share one proxy, e.g.:
+        InstrumentationKey=<any-guid>;IngestionEndpoint=https://bcproxy.example.com/SRV01/BC290/
 
 .PARAMETER SiteName
     IIS site name to create.
 
 .PARAMETER Port
-    HTTP port for the site binding. Use a certificate binding for HTTPS, which BC
-    expects for the ingestion endpoint.
+    HTTP port for the site binding. Use a certificate binding for HTTPS in production.
 
 .PARAMETER OtlpEndpoint
-    OTLP/HTTP endpoint of the local OpenTelemetry Collector.
+    OTLP/HTTP base URL the proxy exports to: the backend itself (e.g. GitLab
+    Observability https://<id>.otel.gitlab-o11y.com:14318) or an optional Collector.
 
 .EXAMPLE
-    .\Install-IISSite.ps1 -PhysicalPath "C:\inetpub\bcproxy" -Port 8888
+    .\Install-IISSite.ps1 -Port 8888 -OtlpEndpoint "https://<id>.otel.gitlab-o11y.com:14318"
 #>
 param(
     [string]$SiteName = "BcTelemetryProxy",
@@ -39,7 +40,7 @@ Import-Module WebAdministration
 Write-Host "Publishing proxy to $PhysicalPath"
 dotnet publish $ProjectPath -c Release -o $PhysicalPath
 
-# Inject the Collector endpoint into appsettings via an environment variable
+# Inject the OTLP endpoint via an environment variable
 # override (ASP.NET Core config: Otlp__Endpoint).
 $appPool = $SiteName
 if (-not (Test-Path "IIS:\AppPools\$appPool")) {

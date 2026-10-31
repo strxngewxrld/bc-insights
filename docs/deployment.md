@@ -1,142 +1,125 @@
 # Deployment guide
 
 This document covers deploying the Business Central telemetry proxy on-premises
-and connecting it to an OTLP-capable observability backend.
+and connecting it to GitLab Observability (or any other OTLP/HTTP backend).
 
 ## Components
 
-1. **BcTelemetryProxy** — ASP.NET Core app hosted in IIS (in-process).
-2. **OpenTelemetry Collector** (`otelcol-contrib`) — Windows service, central and
-   backend-neutral egress; also reads selected Windows Event Log providers.
-3. **Observability backend** — any OTLP/HTTP endpoint.
+1. **BcTelemetryProxy** — ASP.NET Core app hosted in IIS (in-process). Receives
+   App Insights telemetry from any number of BC server instances and exports
+   OTLP/HTTP directly to the backend.
+2. **Observability backend** — GitLab Observability or any OTLP/HTTP endpoint.
+3. *(optional)* **OpenTelemetry Collector** — only if you also want Windows
+   Event Logs or fan-out to several backends. Then set `Otlp:Endpoint` to the
+   Collector (`http://localhost:4318`) and let the Collector forward.
 
-The proxy is backend-agnostic. It always exports to the local Collector; the
-Collector decides where telemetry ultimately goes.
+### Topology for several servers
 
-## 1. Choose a backend (Collector exporter)
+Run **one proxy per site** (or per server, if you prefer local hops) and point
+every BC server instance at it. Each instance names itself in the URL path, so
+data from different hosts and instances stays separate in the backend.
 
-Set `OTLP_EXPORT_ENDPOINT` to your backend's OTLP/HTTP endpoint. The exporter
-appends `/v1/traces`, `/v1/logs` and `/v1/metrics`. Examples:
+## 1. Backend endpoint
 
-- **GitLab Observability (self-managed, GitLab 18.1+)** — exposes OTLP on
-  `:4318` (HTTP) and `:4317` (gRPC), UI on `:8080`. Set
-  `OTLP_EXPORT_ENDPOINT=http://gitlab-observability.example.com:4318`.
-  If your deployment requires project-scoped ingestion with a token, add the
-  header it expects in `config.yaml` (`headers: { PRIVATE-TOKEN: ${env:OTLP_EXPORT_TOKEN} }`)
-  and set `OTLP_EXPORT_TOKEN`.
-- **Grafana stack / Jaeger / vendor OTLP** — point `OTLP_EXPORT_ENDPOINT` at the
-  collector/gateway and add auth headers if needed.
+**GitLab Observability (GitLab.com):** the group's observability settings show
+the OTLP endpoints, e.g.
 
-GitLab is a *supported target*, not a hard dependency: switching backends is a
-one-line change to the exporter endpoint.
-
-## 2. OpenTelemetry Collector
-
-```powershell
-# Run as Administrator
-.\deploy\otel-collector\Install-Collector.ps1 `
-    -OtlpExportEndpoint "https://observability.example.com:4318"
+```
+HTTPS  https://<id>.otel.gitlab-o11y.com:14318   ← use this
+HTTP   http://<id>.otel.gitlab-o11y.com:4318     (unencrypted, lab only)
 ```
 
-This downloads `otelcol-contrib` (needed for the `windowseventlog` receiver),
-installs [`config.yaml`](../deploy/otel-collector/config.yaml), and registers an
-auto-start Windows service. The config uses **batching, retry-on-failure and a
-sending queue**, and keeps **TLS verification on** (`insecure: false`).
+Set `Otlp:Endpoint` to the HTTPS base URL; the proxy appends `/v1/logs`,
+`/v1/traces` and `/v1/metrics`. The per-group endpoint currently accepts data
+without an auth header. If your backend requires one, add it under
+`Otlp:Headers` (e.g. env var `Otlp__Headers__Authorization`), never in source control.
 
-### Windows Event Log scope
+## 2. Proxy on IIS
 
-By default the Collector does **not** ship the entire System/Application
-channels. It is scoped to BC-relevant providers (BC Server, .NET Runtime,
-ASP.NET Core Module, `BcTelemetryProxy`) and, for the System channel, to
-warning/error levels. Adjust the `query` filters in `config.yaml` to add specific
-providers or event ids.
-
-Validate locally first by temporarily switching the pipeline exporters to `debug`
-and watching the console output.
-
-## 3. Proxy on IIS
-
-Prerequisites on the BC/IIS host:
+Prerequisites on the proxy host:
 
 - **ASP.NET Core 8 Hosting Bundle** — <https://dotnet.microsoft.com/download/dotnet/8.0>
 - IIS with the ASP.NET Core Module V2 (installed by the Hosting Bundle).
+- Outbound HTTPS from the proxy host to the backend (port 14318 for GitLab).
 
 ```powershell
 # Run as Administrator
 .\deploy\iis\Install-IISSite.ps1 -SiteName "BcTelemetryProxy" -Port 8888 `
-    -OtlpEndpoint "http://localhost:4318"
+    -OtlpEndpoint "https://<id>.otel.gitlab-o11y.com:14318"
 ```
 
-The [`web.config`](../src/BcTelemetryProxy/web.config) configures the in-process
-ASP.NET Core Module. `Otlp:Endpoint` (env var `Otlp__Endpoint`) points the proxy
-at the local Collector. Ingestion limits, attribute privacy and resource
-attributes are configured in `appsettings.json`.
+Configuration lives in `appsettings.json`, overridable via environment
+variables (`Section__Key`):
 
-## 4. Point Business Central at the proxy
+| Section     | Purpose                                                             |
+| ----------- | ------------------------------------------------------------------- |
+| `Otlp`      | endpoint, headers, gzip, timeout, queue size, batch size/delay, retry window |
+| `Resource`  | service name/namespace, environment, fallback host/instance, per-source overrides |
+| `Ingestion` | request size / count limits                                         |
+| `Telemetry` | attribute allow/deny/redact/hash lists                              |
 
-On the BC Server instance, set the Application Insights connection string so the
-`IngestionEndpoint` targets the proxy. The instrumentation key can be any GUID.
+## 3. Point Business Central at the proxy
+
+Per BC server instance, set the Application Insights connection string so the
+`IngestionEndpoint` targets the proxy **and names host and instance**. The
+instrumentation key can be any GUID.
 
 ```powershell
-Set-NAVServerConfiguration -ServerInstance BC `
+$host_ = $env:COMPUTERNAME; $instance = "BC290"
+Set-NAVServerConfiguration -ServerInstance $instance `
     -KeyName ApplicationInsightsConnectionString `
-    -KeyValue "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://bcproxy.example.com/"
-Restart-NAVServerInstance -ServerInstance BC
+    -KeyValue "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://bcproxy.example.com:8888/$host_/$instance/"
+Restart-NAVServerInstance -ServerInstance $instance
 ```
 
-For multitenant instances use
-`Mount-NAVTenant -ApplicationInsightsConnectionString "..."` per tenant.
+For multitenant instances use `Mount-NAVTenant -ApplicationInsightsConnectionString "..."`
+per tenant with the same URL; tenants are distinguished by the `bc.tenant.id` attribute.
+
+## 4. What arrives in GitLab
+
+- **Services:** `service.name` (default `business-central`), one
+  `service.instance.id` per `<host>/<instance>`; filter by `host.name`,
+  `bc.server_instance`, `deployment.environment`.
+- **Logs:** every BC signal (RT0005 long-running SQL, RT0018 long-running AL,
+  LC* extension lifecycle, …) with `event.name` = BC event id, original timestamp,
+  severity, and all custom dimensions; numeric `*InMs` companions for durations.
+- **Traces:** requests (server spans) and dependencies (client spans), correlated
+  with logs via trace id.
+- **Metrics:** BC metric telemetry as gauges.
 
 ## Security model
 
-This proxy is a translation layer on a trusted on-prem network. Its security
-posture:
+- **TLS on the ingestion endpoint** — bind a certificate to the IIS site for
+  production. Plain HTTP is acceptable only on a trusted network / lab.
+- **TLS on the egress** — use the backend's HTTPS endpoint.
+- **Endpoint protection** — restrict who can reach the proxy via firewall /
+  host allowlist and/or mTLS at IIS. BC's Application Insights client cannot add
+  auth headers, so network controls are the appropriate protection.
+- **No instrumentation-key validation — by design.** The key is not a secret in
+  this topology; sources are identified by URL path.
+- **Attribute privacy** — review the `Telemetry` allow/deny/redact/hash lists.
 
-- **TLS on the ingestion endpoint** — Business Central expects HTTPS. Bind a
-  certificate to the IIS site (`New-WebBinding -Name BcTelemetryProxy -Protocol https -Port 443`
-  plus a certificate in the machine store). Plain HTTP is a **development/lab
-  profile only** (`appsettings.Development.json`).
-- **TLS on the egress** — the Collector exports with TLS verification enabled by
-  default; do not set `insecure: true` in production.
-- **Endpoint protection** — restrict who can reach `/v2/track` via network rules
-  (firewall / host allowlist) and/or **mTLS** at IIS. Note that Business Central's
-  Application Insights client cannot add custom auth headers, so header/API-key
-  auth is not usable for the BC→proxy hop; network isolation and mTLS are the
-  appropriate controls.
-- **No instrumentation-key validation — by design.** The proxy accepts any
-  instrumentation key: it is a single-tenant, network-trusted compatibility
-  shim, and the key is not a secret in this topology. Do not rely on the key for
-  authentication; rely on network controls instead.
-- **Attribute privacy** — sensitive `properties`/context values are redacted or
-  hashed before export (`Telemetry` config). Review the allow/deny/redact/hash
-  lists for your data.
+## Ingestion and export limits
 
-## Ingestion limits
-
-`appsettings.json` → `Ingestion`:
-
-| Setting                       | Default | Effect                                    |
-| ----------------------------- | ------- | ----------------------------------------- |
-| `MaxCompressedRequestBytes`   | 10 MiB  | rejects oversized compressed bodies (413) |
-| `MaxDecompressedRequestBytes` | 100 MiB | bounds decompressed payload (413)         |
-| `MaxEnvelopeBytes`            | 1 MiB   | oversized single envelope → per-item error |
-| `MaxEnvelopesPerRequest`      | 10 000  | rejects batches with too many items (413) |
+| Setting                                  | Default | Effect                                        |
+| ---------------------------------------- | ------- | --------------------------------------------- |
+| `Ingestion:MaxCompressedRequestBytes`    | 10 MiB  | oversized compressed bodies → 413             |
+| `Ingestion:MaxDecompressedRequestBytes`  | 100 MiB | bounds decompressed payload → 413             |
+| `Ingestion:MaxEnvelopeBytes`             | 1 MiB   | oversized single envelope → per-item error    |
+| `Ingestion:MaxEnvelopesPerRequest`       | 10 000  | too many items → 413                          |
+| `Otlp:MaxQueueSize`                      | 100 000 | queue full → 503 to BC (BC retries)           |
+| `Otlp:MaxBatchSize`                      | 2 000   | items per export request                      |
+| `Otlp:BatchDelayMilliseconds`            | 2 000   | wait for more items before sending            |
+| `Otlp:MaxRetrySeconds`                   | 300     | retry window before a batch is dropped        |
 
 ## Verification
 
-1. **Health** — `GET https://bcproxy.example.com/health` → `{"status":"ok"}`.
-2. **Replay** — post `samples/sample-track-payload.ndjson` (gzipped) to
-   `/v2/track`; expect `{"itemsReceived":6,"itemsAccepted":6,...}`.
-3. **Partial success** — post a batch with one malformed line; expect `206` with
-   `itemsAccepted < itemsReceived` and a populated `errors[]`.
-4. **Backend** — trigger a BC action and confirm traces/logs/metrics appear in
-   the backend UI. Filter by `bc.server_instance` or `eventId`.
-5. **Eventlog** — write a test entry and confirm it reaches the backend.
-
-## Open items
-
-- Confirm the exact backend OTLP path/auth for your deployment (esp. token-scoped
-  GitLab ingestion).
-- Pre-aggregated BC metrics are recorded via the .NET Meter API (no synchronous
-  gauge instrument exists in .NET 8; gauge-like values are recorded loss-light
-  with their aggregate stats as attributes).
+1. **Health** — `GET /health` → `status`, `queueLength`, `exported`, `failed`,
+   `rejected`, `lastSuccessUtc`, `lastError`.
+2. **Replay** — post `samples/sample-track-payload.ndjson` to
+   `/SRV01/BC290/v2/track`; expect `{"itemsReceived":6,"itemsAccepted":6,...}` and
+   `exported` counts rising on `/health`.
+3. **Backend** — in GitLab Observability, filter logs by
+   `service.instance.id = SRV01/BC290`.
+4. **BC** — sign in to BC and open a few pages; BC sends telemetry in batches,
+   so allow a minute before it appears.

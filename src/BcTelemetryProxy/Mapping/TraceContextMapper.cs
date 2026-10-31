@@ -58,6 +58,15 @@ public static class TraceContextMapper
         return null;
     }
 
+    /// <summary>
+    /// Span id of a request/dependency: BC's own id when it is a valid 16-hex W3C
+    /// span id (so child items referencing it as parent link up), otherwise random.
+    /// </summary>
+    public static ActivitySpanId ResolveSpanId(string? id)
+        => !string.IsNullOrWhiteSpace(id) && IsValidSpanId(id)
+            ? ActivitySpanId.CreateFromString(id.AsSpan())
+            : ActivitySpanId.CreateRandom();
+
     private static bool IsValidTraceId(string value)
         => value.Length == TraceIdHexLength && IsHex(value) && !IsAllZero(value);
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -53,14 +54,27 @@ public sealed class AttributeMapper
     /// </summary>
     public static void AddCustomProperties(List<KeyValuePair<string, object?>> target, JsonElement data)
     {
-        foreach (var (key, value) in data.EnumerateCustomProperties())
+        var properties = data.EnumerateCustomProperties().ToList();
+        var keys = new HashSet<string>(properties.Select(p => p.Key), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (key, value) in properties)
         {
             if (string.IsNullOrEmpty(value))
             {
                 continue;
             }
 
-            Add(target, key, value);
+            target.Add(new(key, TypedValue(key, value)));
+
+            // BC reports durations as "hh:mm:ss.fffffff"; add a numeric companion
+            // (unless BC already sent one) so backends can aggregate and filter on it.
+            var msKey = key + "InMs";
+            if (!keys.Contains(msKey) &&
+                value.Contains(':') &&
+                TimeSpan.TryParseExact(value, "c", CultureInfo.InvariantCulture, out var duration))
+            {
+                target.Add(new(msKey, duration.TotalMilliseconds));
+            }
 
             switch (key)
             {
@@ -85,11 +99,51 @@ public sealed class AttributeMapper
                     Add(target, "bc.client_type", value);
                     break;
                 case "httpStatusCode":
-                    Add(target, "http.response.status_code", value);
+                    AddStatusCode(target, value);
                     break;
             }
         }
     }
+
+    /// <summary>Adds <c>http.response.status_code</c> as an integer (semantic convention type).</summary>
+    public static void AddStatusCode(List<KeyValuePair<string, object?>> target, string? value)
+    {
+        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var code))
+        {
+            target.Add(new("http.response.status_code", code));
+        }
+        else
+        {
+            Add(target, "http.response.status_code", value);
+        }
+    }
+
+    /// <summary>
+    /// Known numeric BC dimensions (counters and <c>*InMs</c> durations) are
+    /// exported as numbers; everything else stays a string so a key never
+    /// changes type between records.
+    /// </summary>
+    private static object TypedValue(string key, string value)
+    {
+        var numeric = key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase) || NumericKeys.Contains(key);
+        if (!numeric)
+        {
+            return value;
+        }
+
+        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
+        {
+            return l;
+        }
+
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : value;
+    }
+
+    private static readonly HashSet<string> NumericKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "sqlExecutes", "sqlRowsRead", "sqlStatementsExecuted", "totalRows", "rowsAffected",
+        "httpStatusCode", "numberOfJoins", "numberOfRecords", "retryCount", "alStackDepth",
+    };
 
     /// <summary>
     /// Applies the configured privacy rules. Returns a new list containing only
