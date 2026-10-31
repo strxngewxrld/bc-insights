@@ -1443,7 +1443,7 @@
       "thresholds": [],
       "timePreferance": "GLOBAL_TIME",
       "title": "BC server process memory",
-      "yAxisUnit": "bytes"
+      "yAxisUnit": "By"
     },
     {
       "bucketCount": 30,
@@ -2074,7 +2074,7 @@
               "disabled": false,
               "expression": "A",
               "filter": {
-                "expression": "deployment.environment IN $deployment.environment AND service.instance.id IN $instance AND event.name = 'bc.error.first_seen'"
+                "expression": "deployment.environment IN $deployment.environment AND service.instance.id IN $instance AND attribute.event.name = 'bc.error.first_seen'"
               },
               "functions": [],
               "groupBy": [],
@@ -3176,7 +3176,7 @@
       "thresholds": [],
       "timePreferance": "GLOBAL_TIME",
       "title": "Transaction log used",
-      "yAxisUnit": "bytes"
+      "yAxisUnit": "By"
     },
     {
       "bucketCount": 30,
@@ -3422,7 +3422,7 @@
               "disabled": false,
               "expression": "A",
               "filter": {
-                "expression": "deployment.environment IN $deployment.environment AND service.name = 'sql-server' AND event.name IN ('sqlserver.blocking', 'sqlserver.deadlock')"
+                "expression": "deployment.environment IN $deployment.environment AND service.name = 'sql-server' AND attribute.event.name IN ('sqlserver.blocking', 'sqlserver.deadlock')"
               },
               "functions": [],
               "groupBy": [],
