@@ -7,6 +7,7 @@ using BcTelemetryProxy.Configuration;
 using BcTelemetryProxy.Diagnostics;
 using BcTelemetryProxy.Mapping;
 using BcTelemetryProxy.Model;
+using BcTelemetryProxy.Support;
 using Microsoft.Extensions.Options;
 
 namespace BcTelemetryProxy.Export;
@@ -30,19 +31,22 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
     private readonly Uri _metricsUri;
     private readonly ExportStatistics _stats = new();
     private readonly DebugCapture? _capture;
+    private readonly PerformanceRegistry? _performance;
 
     public OtlpExporter(
         IOptions<OtlpOptions> options,
         ILogger<OtlpExporter> logger,
         HttpMessageHandler? handler = null,
-        DebugCapture? capture = null)
+        DebugCapture? capture = null,
+        PerformanceRegistry? performance = null)
     {
         _options = options.Value;
         _logger = logger;
         _capture = capture;
+        _performance = performance;
         _queue = Channel.CreateBounded<object>(new BoundedChannelOptions(_options.MaxQueueSize)
         {
-            FullMode = BoundedChannelFullMode.DropWrite,
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
         });
 
@@ -70,7 +74,11 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
 
     public void EmitLog(LogItem log) => Enqueue(log);
 
-    public void EmitSpan(SpanItem span) => Enqueue(span);
+    public void EmitSpan(SpanItem span)
+    {
+        _performance?.Record(span);
+        Enqueue(span);
+    }
 
     public void EmitMetric(MetricItem metric) => Enqueue(metric);
 
@@ -195,8 +203,8 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
                 using var response = await _http.SendAsync(request, ct);
                 if (response.IsSuccessStatusCode)
                 {
-                    await HandlePartialSuccessAsync(signal, response, ct);
-                    _stats.RecordSuccess(signal, count);
+                    var rejected = await HandlePartialSuccessAsync(signal, response, ct);
+                    _stats.RecordSuccess(signal, count - (int)Math.Clamp(rejected, 0, count), healthy: rejected == 0);
                     return;
                 }
 
@@ -219,7 +227,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
                 error = ex.Message;
             }
 
-            _stats.RecordError($"{signal}: {error}");
+            _stats.RecordError($"{signal}: {error}", signal);
             var wait = retryAfter is { } ra && ra < TimeSpan.FromMinutes(1) ? ra : delay;
             if (!retry || DateTime.UtcNow + wait > deadline)
             {
@@ -246,11 +254,11 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
         return buffer.ToArray();
     }
 
-    private async Task HandlePartialSuccessAsync(string signal, HttpResponseMessage response, CancellationToken ct)
+    private async Task<long> HandlePartialSuccessAsync(string signal, HttpResponseMessage response, CancellationToken ct)
     {
         if (response.Content.Headers.ContentType?.MediaType?.Contains("json", StringComparison.OrdinalIgnoreCase) != true)
         {
-            return;
+            return 0;
         }
 
         try
@@ -258,7 +266,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
             using var doc = JsonDocument.Parse(await response.Content.ReadAsStreamAsync(ct));
             if (!doc.RootElement.TryGetProperty("partialSuccess", out var partial) || partial.ValueKind != JsonValueKind.Object)
             {
-                return;
+                return 0;
             }
 
             long rejected = 0;
@@ -274,20 +282,24 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
             if (rejected > 0 || !string.IsNullOrEmpty(message))
             {
                 Interlocked.Add(ref _stats.Rejected, rejected);
-                _stats.RecordError($"{signal}: backend rejected {rejected} item(s): {message}");
+                _stats.RecordError($"{signal}: backend rejected {rejected} item(s): {message}", signal);
                 _logger.LogWarning("OTLP {Signal} partial success: {Rejected} rejected ({Message})", signal, rejected, message);
             }
+
+            return rejected > 0 ? rejected : !string.IsNullOrEmpty(message) ? -1 : 0;
         }
-        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
+
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or OverflowException)
         {
             // A non-standard success body is not an export failure.
         }
+        return 0;
     }
 
     private void Fail(string signal, int count, string error, bool retried)
     {
         Interlocked.Add(ref _stats.Failed, count);
-        _stats.RecordError($"{signal}: {error}");
+        _stats.RecordError($"{signal}: {error}", signal);
         _logger.LogError("OTLP {Signal} export failed{Retried}, dropping {Count} item(s): {Error}",
             signal, retried ? " after retries" : string.Empty, count, error);
     }
@@ -302,6 +314,8 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
 /// <summary>Export counters surfaced on <c>/health</c>.</summary>
 public sealed class ExportStatistics
 {
+    private readonly object _lock = new();
+    private readonly HashSet<string> _unhealthySignals = new(StringComparer.Ordinal);
     public long Dropped;
     public long Failed;
     public long Rejected;
@@ -315,16 +329,20 @@ public sealed class ExportStatistics
 
     public DateTime? LastSuccessUtc { get; private set; }
 
-    /// <summary>True while the most recent export attempt failed (or nothing succeeded yet after an error).</summary>
-    public bool IsDegraded => LastErrorUtc is { } error && (LastSuccessUtc is not { } success || error > success);
+    /// <summary>True until every failed signal has subsequently exported without a rejection.</summary>
+    public bool IsDegraded { get { lock (_lock) { return _unhealthySignals.Count > 0; } } }
 
-    public void RecordError(string error)
+    public void RecordError(string error, string signal)
     {
-        LastError = error;
-        LastErrorUtc = DateTime.UtcNow;
+        lock (_lock)
+        {
+            _unhealthySignals.Add(signal);
+            LastError = error;
+            LastErrorUtc = DateTime.UtcNow;
+        }
     }
 
-    public void RecordSuccess(string signal, int count)
+    public void RecordSuccess(string signal, int count, bool healthy = true)
     {
         switch (signal)
         {
@@ -339,6 +357,13 @@ public sealed class ExportStatistics
                 break;
         }
 
-        LastSuccessUtc = DateTime.UtcNow;
+        if (healthy)
+        {
+            lock (_lock)
+            {
+                _unhealthySignals.Remove(signal);
+                LastSuccessUtc = DateTime.UtcNow;
+            }
+        }
     }
 }

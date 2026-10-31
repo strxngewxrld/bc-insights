@@ -132,7 +132,7 @@ public sealed class AttributeMapper
             return l;
         }
 
-        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : value;
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) && double.IsFinite(d) ? d : value;
     }
 
     private static void AddOnce(List<KeyValuePair<string, object?>> target, HashSet<string> written, string key, object value)

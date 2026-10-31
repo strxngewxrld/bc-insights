@@ -425,7 +425,7 @@ public class ExportStatisticsTests
 
         stats.RecordSuccess("logs", 1);
         Thread.Sleep(5);
-        stats.RecordError("logs: down");
+        stats.RecordError("logs: down", "logs");
         Assert.True(stats.IsDegraded);
 
         Thread.Sleep(5);

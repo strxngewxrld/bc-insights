@@ -76,6 +76,25 @@ Variables: `deployment.environment`, `instance` (`service.instance.id`), `host`.
 Import: GitLab → *Observe* → *Dashboards* → *New dashboard* → *Import JSON*
 (verified on GitLab.com: all panels render, including the log and trace panels).
 
+## Performance triage
+
+On the proxy, `/support/performance?hours=24` and `/support/performance/report`
+provide a ranked overview and a Markdown CSP report. See the
+[performance workflow](../../docs/deployment.md#performance-analysis-for-devops-and-the-csp).
+The local overview is bounded and resets on restart; use GitLab for history.
+
+In *Traces*, group by `bc.event.id`, `extensionName`, `extensionPublisher`,
+`alObjectType`, `alObjectId` and `service.instance.id`. Compare count, accumulated
+duration and p95 rather than p95 alone. Filter `service.version`/`bc.version`
+and environment to avoid mixing builds or test traffic. SQL (`RT0005`), locking
+(`RT0012`/`RT0028`), AL (`RT0018`) and outgoing HTTP (`RT0019`) are useful starting
+points. Open the slowest trace, correlate `sqlServerSessionId` with SQL blocking
+and waits, and compare the same interval with CPU, disk I/O and BC SQL connections.
+
+BC emits thresholded/sampled events; spans can overlap. Consequently observed
+span p95 is not the p95 of all user actions, and sums are not wall-clock time.
+No automatic SQL/BC tuning is applied by this workflow.
+
 ## Alerting ideas
 
 Build alerts in GitLab Observability on:

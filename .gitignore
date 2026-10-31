@@ -20,3 +20,6 @@ coverage*.xml
 # OS
 .DS_Store
 Thumbs.db
+
+# Local runtime, encrypted configuration snapshots and audit artifacts
+.local/

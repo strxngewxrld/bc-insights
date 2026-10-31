@@ -19,6 +19,9 @@ public sealed class SupportOptions
     /// <summary>Latest occurrences kept per error kind.</summary>
     public int SamplesPerError { get; set; } = 3;
 
+    /// <summary>Bound on compact span samples used by the 24-hour performance overview.</summary>
+    public int MaxPerformanceSamples { get; set; } = 20000;
+
     /// <summary>
     /// Emit a <c>bc.error.first_seen</c> log the first time an error kind occurs
     /// (since the proxy started), e.g. for an alert that notifies the partner.

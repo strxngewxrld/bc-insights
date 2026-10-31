@@ -42,6 +42,17 @@ public static class SupportEndpoints
                 ? Results.StatusCode(StatusCodes.Status403Forbidden)
                 : await next(context));
 
+        group.MapGet("/performance", (PerformanceRegistry registry, double? hours, string? instance) =>
+            hours is { } h && !double.IsFinite(h)
+                ? Results.BadRequest(new { error = "hours must be finite" })
+                : Results.Json(registry.Overview(hours ?? 24, instance)));
+
+        group.MapGet("/performance/report", (PerformanceRegistry registry, double? hours, string? instance) =>
+            hours is { } h && !double.IsFinite(h)
+                ? Results.BadRequest(new { error = "hours must be finite" })
+                : Results.Text(PerformanceReport(registry.Overview(hours ?? 24, instance), options.TraceUrlTemplate),
+                    "text/markdown; charset=utf-8"));
+
         group.MapGet("/errors", (ErrorRegistry registry, double? hours) =>
             Results.Json(registry.List(TimeSpan.FromHours(Math.Clamp(hours ?? 24, 0.1, 24 * 30)))
                 .Select(e => new
@@ -69,6 +80,35 @@ public static class SupportEndpoints
 
     private static bool IsLocal(IPAddress? address)
         => address is null || IPAddress.IsLoopback(address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address);
+
+    public static string PerformanceReport(PerformanceOverview overview, string? traceUrlTemplate)
+    {
+        var sb = new StringBuilder("# Business Central performance triage\n\n");
+        sb.Append("UTC: ").Append(Time(overview.SinceUtc)).Append(" – ").AppendLine(Time(overview.UntilUtc)).AppendLine();
+        sb.Append("Observed spans: ").Append(overview.ObservedSpans).Append("; evictions since startup: ")
+            .Append(overview.EvictedSamples).AppendLine().AppendLine();
+        sb.AppendLine(overview.Scope).AppendLine();
+        sb.AppendLine("Ranked by accumulated observed span time. Next steps are investigation suggestions, not proven causes.").AppendLine();
+        foreach (var operation in overview.Operations)
+        {
+            sb.Append("## ").AppendLine(operation.Key.Operation.ReplaceLineEndings(" ")).AppendLine();
+            sb.AppendLine("| | |\n|---|---|");
+            Row(sb, "Instance / environment", $"{operation.Key.Instance} / {operation.Key.Environment}");
+            Row(sb, "BC build / event", $"{operation.Key.Version} / {operation.Key.EventId}");
+            Row(sb, "Extension", Join(operation.Key.Extension, operation.Key.Publisher, operation.Key.ExtensionVersion));
+            Row(sb, "AL object", Join(operation.Key.ObjectType, operation.Key.ObjectId));
+            Row(sb, "Tenant / company", Join(operation.Key.Tenant, operation.Key.Company));
+            Row(sb, "Observed / failed", $"{operation.Count} / {operation.Failed}");
+            Row(sb, "Total / average / p95 / max (ms)", FormattableString.Invariant($"{operation.TotalMs:F2} / {operation.AverageMs:F2} / {operation.P95Ms:F2} / {operation.MaxMs:F2}"));
+            Row(sb, "Slowest trace", operation.Slowest.TraceId);
+            Row(sb, "Slowest sample (UTC)", Time(operation.Slowest.TimeUtc));
+            foreach (var (key, value) in operation.Slowest.Details) Row(sb, key, value);
+            sb.AppendLine().AppendLine(operation.NextStep).AppendLine();
+            if (!string.IsNullOrWhiteSpace(traceUrlTemplate))
+                sb.AppendLine(traceUrlTemplate.Replace("{traceId}", operation.Slowest.TraceId, StringComparison.Ordinal)).AppendLine();
+        }
+        return sb.ToString();
+    }
 
     /// <summary>Markdown support report for one error kind.</summary>
     public static string Report(ErrorSummary e, string? traceUrlTemplate)

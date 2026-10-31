@@ -32,10 +32,12 @@ builder.WebHost.ConfigureKestrel(kestrel => kestrel.Limits.MaxRequestBodySize = 
 // The proxy exports OTLP/HTTP directly to the backend (e.g. GitLab
 // Observability); a Collector in between is optional.
 builder.Services.AddSingleton<DebugCapture>();
+builder.Services.AddSingleton<PerformanceRegistry>();
 builder.Services.AddSingleton(sp => new OtlpExporter(
     sp.GetRequiredService<IOptions<OtlpOptions>>(),
     sp.GetRequiredService<ILogger<OtlpExporter>>(),
-    capture: sp.GetRequiredService<DebugCapture>()));
+    capture: sp.GetRequiredService<DebugCapture>(),
+    performance: sp.GetRequiredService<PerformanceRegistry>()));
 builder.Services.AddSingleton<IOtelEmitter>(sp => sp.GetRequiredService<OtlpExporter>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OtlpExporter>());
 

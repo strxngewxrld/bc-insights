@@ -143,6 +143,29 @@ The proxy keeps counts, affected users / sessions and the latest samples in memo
   trace, AL object, extension and publisher, SQL statement, operation, session and
   trace ids. Local callers only by default (`Support:LocalOnly`).
 
+### Performance triage for DevOps and the CSP
+
+`GET /support/performance?hours=24&instance=SRV01%2FBC290` ranks the top 100
+observed operations by accumulated span duration, with count, failures, average,
+nearest-rank p95, maximum, the slowest trace and investigation suggestions.
+Groups separate instance, environment, BC build, event, extension/publisher/version,
+AL object, tenant and company. Omit `instance` for all instances.
+
+`GET /support/performance/report` exports the same overview as Markdown for a
+CSP ticket. `Support:TraceUrlTemplate` adds links to the slowest traces.
+Both routes share the local-only access control of the error reports.
+
+The overview retains at most `Support:MaxPerformanceSamples` (20,000) compact,
+already-filtered positive-duration span samples in memory; it resets on restart.
+`evictedSamples` signals capacity truncation. The requested time range filters
+event completion timestamps, including out-of-order data. No SQL text, stack or
+message is copied into these samples. **These are observed telemetry spans, not
+all BC operations or end-user response times:** BC thresholds/sampling bias p95,
+and overlapping spans can double-count accumulated time. Use GitLab for history.
+
+Numeric duration companions (`executionTimeInMs`, `totalTimeInMs`, etc.) also
+produce spans and take precedence over the corresponding TimeSpan string.
+
 ### Trace context
 
 `ai.operation.id` becomes the trace id (see `Mapping/TraceContextMapper.cs`): a
@@ -170,7 +193,7 @@ SQL statements, lock timeouts and the error dialog appear together in one trace.
   partial-success rejections are logged and counted.
 - **Attribute privacy** (`Telemetry`): allowlist / denylist / redaction / hashing.
 - **Observability of the proxy**: `GET /health` reports `status` (`degraded`
-  while the latest export failed), queue length, exported / dropped / failed /
+  until every failed signal exports successfully again), queue length, exported / dropped / failed /
   rejected counts, last success, last error and its time.
 - **Debug capture** (`Debug:CaptureDirectory`, off by default): writes raw BC
   envelopes and the exported OTLP JSON to `capture-yyyyMMdd.ndjson` for mapping

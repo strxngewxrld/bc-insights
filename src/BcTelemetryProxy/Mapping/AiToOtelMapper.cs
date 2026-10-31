@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -155,7 +155,7 @@ public sealed partial class AiToOtelMapper
             level = LogLevel.Error;
         }
 
-        var duration = _mapping.DeriveSpans ? EventDuration(data) : null;
+        var duration = _mapping.DeriveSpans ? EventDuration(data, env.TimestampUtc) : null;
         var failed = _mapping.DeriveSpans && level >= LogLevel.Error;
         if (duration is null && !failed)
         {
@@ -272,28 +272,33 @@ public sealed partial class AiToOtelMapper
         return line is { Length: > 200 } ? line[..200] : line;
     }
 
-    private TimeSpan? EventDuration(JsonElement data)
+    private TimeSpan? EventDuration(JsonElement data, DateTime timestampUtc)
     {
+        var maxDurationMilliseconds = (timestampUtc - DateTime.MinValue).TotalMilliseconds;
         foreach (var key in _durationKeys)
         {
+            var numericKey = key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase) ? key : key + "InMs";
+            var numericValue = data.GetCustomProperty(numericKey);
+            if (double.TryParse(numericValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var milliseconds) &&
+                double.IsFinite(milliseconds) && milliseconds >= 0 && milliseconds <= maxDurationMilliseconds)
+            {
+                return TimeSpan.FromMilliseconds(milliseconds);
+            }
+
             var value = data.GetCustomProperty(key);
             if (value is null)
             {
                 continue;
             }
 
-            // e.g. alJobQueueExecutionTimeInMs = "88" (which would also parse as 88 days)
-            if (key.EndsWith("InMs", StringComparison.Ordinal))
+            // Numeric millisecond keys were handled above; never parse them as days.
+            if (key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase))
             {
-                if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var ms) && ms >= 0)
-                {
-                    return TimeSpan.FromMilliseconds(ms);
-                }
-
                 continue;
             }
 
-            if (TimeSpan.TryParseExact(value, "c", CultureInfo.InvariantCulture, out var duration) && duration >= TimeSpan.Zero)
+            if (TimeSpan.TryParseExact(value, "c", CultureInfo.InvariantCulture, out var duration) &&
+                duration >= TimeSpan.Zero && duration.TotalMilliseconds <= maxDurationMilliseconds)
             {
                 return duration;
             }

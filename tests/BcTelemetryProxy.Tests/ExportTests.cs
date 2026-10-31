@@ -377,6 +377,46 @@ public class OtlpExporterTests
         Assert.False(exporter.HasCapacity(2));
     }
 
+    [Fact]
+    public void Full_queue_counts_every_dropped_item()
+    {
+        using var exporter = Exporter(new FakeHandler(HttpStatusCode.OK), maxQueue: 2);
+        for (var i = 0; i < 5; i++) exporter.EmitLog(Log());
+        Assert.Equal(2, exporter.QueueLength);
+        Assert.Equal(3, exporter.Statistics.Dropped);
+    }
+
+    [Fact]
+    public async Task Partial_rejection_is_not_counted_as_exported_or_healthy()
+    {
+        var handler = new FakeHandler(HttpStatusCode.OK)
+        {
+            ResponseBody = """{"partialSuccess":{"rejectedLogRecords":"1","errorMessage":"invalid attributes"}}""",
+        };
+        using var exporter = Exporter(handler);
+        exporter.EmitLog(Log());
+        exporter.EmitLog(Log());
+        await exporter.StartAsync(CancellationToken.None);
+        await handler.NextAsync();
+        await WaitUntil(() => exporter.Statistics.ExportedLogs == 1);
+        await exporter.StopAsync(CancellationToken.None);
+        Assert.Equal(1, exporter.Statistics.Rejected);
+        Assert.Equal(1, exporter.Statistics.ExportedLogs);
+        Assert.True(exporter.Statistics.IsDegraded);
+        Assert.Null(exporter.Statistics.LastSuccessUtc);
+    }
+
+    [Fact]
+    public void Metrics_success_cannot_hide_trace_export_failure()
+    {
+        var stats = new ExportStatistics();
+        stats.RecordError("traces: HTTP 400", "traces");
+        stats.RecordSuccess("metrics", 10);
+        Assert.True(stats.IsDegraded);
+        stats.RecordSuccess("traces", 1);
+        Assert.False(stats.IsDegraded);
+    }
+
     private static async Task WaitUntil(Func<bool> condition)
     {
         for (var i = 0; i < 100 && !condition(); i++)
@@ -389,6 +429,7 @@ public class OtlpExporterTests
 
     public sealed class FakeHandler(params HttpStatusCode[] statuses) : HttpMessageHandler
     {
+        public string ResponseBody { get; init; } = "{}";
         private readonly BlockingCollection<CapturedRequest> _requests = new();
         private int _calls;
 
@@ -409,7 +450,7 @@ public class OtlpExporterTests
             _requests.Add(new CapturedRequest(request.RequestUri!.ToString(), encoding, test?.FirstOrDefault(), body), ct);
 
             var status = statuses[Math.Min(call, statuses.Length) - 1];
-            return new HttpResponseMessage(status) { Content = new StringContent("{}", Encoding.UTF8, "application/json") };
+            return new HttpResponseMessage(status) { Content = new StringContent(ResponseBody, Encoding.UTF8, "application/json") };
         }
     }
 }

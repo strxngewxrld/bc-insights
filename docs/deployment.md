@@ -167,6 +167,32 @@ Restart-NAVServerInstance BC290
    (new error kind), `exception` count by type, `sqlserver.deadlock`, `sqlserver.up = 0`.
    See [alerting ideas](../deploy/gitlab-o11y/README.md#alerting-ideas).
 
+## Performance analysis for DevOps and the CSP
+
+On the proxy host, open `http://localhost:5140/support/performance?hours=24`
+or `/support/performance/report` for Markdown. Filter a specific source with
+`&instance=SRV01%2FBC290`. Routes use the existing `Support:LocalOnly` policy.
+The top 100 operation groups are sorted by accumulated observed duration and
+separate BC builds, instances, environments, extensions, AL objects and tenants.
+Compare count, average, nearest-rank p95 and maximum together; follow the slowest
+trace, then correlate its SQL session with blocking/waits and host metrics.
+The `NextStep` field suggests an investigation, without asserting a root cause.
+
+The memory bound is `Support:MaxPerformanceSamples` (20,000; clamped to
+1–200,000). Samples reset on restart; `evictedSamples` counts capacity evictions
+since startup. Time selection uses span completion timestamps. Only compact,
+already-filtered fields are retained, without SQL text or stack traces. These
+statistics describe observed positive-duration spans; BC thresholds/sampling and
+overlapping spans prevent treating them as total user latency or complete workload
+statistics. For historical comparisons, retain telemetry in GitLab.
+
+Start with the highest accumulated duration, then investigate repeated SQL calls
+and rows read, AL filters and loops, blocking/deadlocks, and external HTTP calls.
+Use identical workloads and builds for before/after comparisons. Inspect execution
+plans before making index changes; validate AL changes in a test environment.
+Microsoft documents RT0005 and its duration/SQL dimensions in
+[long-running SQL telemetry](https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/administration/telemetry-long-running-sql-query-trace).
+
 ## Security model
 
 - **TLS on the ingestion endpoint** — bind a certificate to the IIS site for
