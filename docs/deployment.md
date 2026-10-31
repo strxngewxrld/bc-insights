@@ -15,9 +15,15 @@ and connecting it to GitLab Observability (or any other OTLP/HTTP backend).
 
 ### Topology for several servers
 
-Run **one proxy per site** (or per server, if you prefer local hops) and point
-every BC server instance at it. Each instance names itself in the URL path, so
-data from different hosts and instances stays separate in the backend.
+Every BC server instance names itself in the URL path, so data from different
+hosts and instances stays separate in the backend, whether they share a proxy or not.
+
+**Prefer one proxy per BC server** (IIS on the same machine, `IngestionEndpoint`
+on `localhost`): BC does **not** buffer or resend telemetry it cannot deliver, so
+anything sent while the proxy is unreachable is lost. A local, always-on proxy
+removes the network hop as a failure point; the proxy itself buffers and retries
+towards the backend (`Otlp:MaxQueueSize`, `Otlp:MaxRetrySeconds`). A shared proxy
+per site works too, but then make it highly available.
 
 ## 1. Backend endpoint
 
@@ -57,6 +63,7 @@ variables (`Section__Key`):
 | `Resource`  | service name/namespace, environment, fallback host/instance, per-source overrides |
 | `Ingestion` | request size / count limits                                         |
 | `Telemetry` | attribute allow/deny/redact/hash lists                              |
+| `Debug`     | optional capture of raw envelopes / exported OTLP (troubleshooting) |
 
 ## 3. Point Business Central at the proxy
 
@@ -121,5 +128,22 @@ per tenant with the same URL; tenants are distinguished by the `bc.tenant.id` at
    `exported` counts rising on `/health`.
 3. **Backend** — in GitLab Observability, filter logs by
    `service.instance.id = SRV01/BC290`.
-4. **BC** — sign in to BC and open a few pages; BC sends telemetry in batches,
-   so allow a minute before it appears.
+4. **BC** — sign in to BC and open a few pages; BC sends telemetry in batches
+   about every 30 seconds. A sign-in produces `RT0004`, an error dialog `RT0030`
+   (severity ERROR).
+
+## Troubleshooting
+
+- `GET /health` → `status: degraded` and `lastError` show export problems
+  (unreachable backend, TLS, HTTP 4xx); `failed` counts items given up after
+  `Otlp:MaxRetrySeconds`.
+- BC gets `503` when the export queue is full (backend down for a long time);
+  BC then drops that batch.
+- **Mapping check:** set `Debug:CaptureDirectory` (e.g. env
+  `Debug__CaptureDirectory=C:\bcproxy\capture`) and restart. Every received
+  envelope (`kind: ingest`, with source and mapping status) and every OTLP request
+  (`kind: export`) is appended to `capture-yyyyMMdd.ndjson` until
+  `Debug:MaxCaptureBytes` (100 MiB) is reached. The capture is unfiltered — it may
+  contain personal data; switch it off and delete the files afterwards.
+- `Logging:LogLevel:BcTelemetryProxy=Debug` logs one line per ingestion request
+  (source, received, accepted, errors).

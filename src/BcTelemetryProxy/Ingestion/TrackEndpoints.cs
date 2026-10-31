@@ -1,4 +1,5 @@
 ﻿using BcTelemetryProxy.Configuration;
+using BcTelemetryProxy.Diagnostics;
 using BcTelemetryProxy.Export;
 using BcTelemetryProxy.Mapping;
 using Microsoft.Extensions.Options;
@@ -27,7 +28,7 @@ public static class TrackEndpoints
             var s = exporter.Statistics;
             return Results.Ok(new
             {
-                status = s.LastSuccessUtc is null && s.LastError is not null ? "degraded" : "ok",
+                status = s.IsDegraded ? "degraded" : "ok",
                 queueLength = exporter.QueueLength,
                 exported = new { logs = s.ExportedLogs, spans = s.ExportedSpans, metrics = s.ExportedMetrics },
                 dropped = s.Dropped,
@@ -35,6 +36,7 @@ public static class TrackEndpoints
                 rejected = s.Rejected,
                 lastSuccessUtc = s.LastSuccessUtc,
                 lastError = s.LastError,
+                lastErrorUtc = s.LastErrorUtc,
             });
         });
 
@@ -50,6 +52,7 @@ public static class TrackEndpoints
         AiToOtelMapper mapper,
         SourceResolver sources,
         OtlpExporter exporter,
+        DebugCapture capture,
         IOptions<IngestionOptions> ingestionOptions,
         ILogger<AiToOtelMapper> logger)
     {
@@ -78,7 +81,7 @@ public static class TrackEndpoints
         EnvelopeReadResult read;
         try
         {
-            read = await EnvelopeReader.ReadAsync(context.Request.Body, gzip, options, context.RequestAborted);
+            read = await EnvelopeReader.ReadAsync(context.Request.Body, gzip, options, context.RequestAborted, capture.Enabled);
         }
         catch (Exception ex)
         {
@@ -119,10 +122,16 @@ public static class TrackEndpoints
         }
 
         var caller = context.Connection.RemoteIpAddress;
+        var routeSource = string.Join('/', new[] { routeHost, routeInstance }.Where(v => v is not null));
         var accepted = 0;
         var errors = new List<object>();
         foreach (var item in read.Items)
         {
+            if (item.Status != EnvelopeItemStatus.Parsed)
+            {
+                capture.CaptureEnvelope(routeSource, item.Status.ToString(), item.Raw);
+            }
+
             switch (item.Status)
             {
                 case EnvelopeItemStatus.Malformed:
@@ -133,7 +142,9 @@ public static class TrackEndpoints
                     break;
                 case EnvelopeItemStatus.Parsed:
                     var source = sources.Resolve(routeHost, routeInstance, item.Envelope!, caller);
-                    switch (mapper.Map(item.Envelope!, source))
+                    var status = mapper.Map(item.Envelope!, source);
+                    capture.CaptureEnvelope(source.ServiceInstanceId, status.ToString(), item.Raw);
+                    switch (status)
                     {
                         case MappingStatus.Mapped:
                         case MappingStatus.Unsupported:
@@ -148,6 +159,9 @@ public static class TrackEndpoints
                     break;
             }
         }
+
+        logger.LogDebug("Ingested {Received} envelope(s) from {Source}: {Accepted} accepted, {Errors} error(s)",
+            read.Items.Count, routeSource.Length > 0 ? routeSource : caller?.ToString(), accepted, errors.Count);
 
         var response = new IngestionResponse(read.Items.Count, accepted) { errors = errors.ToArray() };
         return errors.Count > 0

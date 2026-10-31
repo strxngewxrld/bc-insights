@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace BcTelemetryProxy.Mapping;
@@ -10,9 +11,37 @@ namespace BcTelemetryProxy.Mapping;
 public static class SeverityMap
 {
     /// <summary>
+    /// Reads <c>severityLevel</c> from AI <c>baseData</c>. The Application Insights
+    /// SDK used by Business Central serialises it as a name ("Information",
+    /// "Warning", ...); the numeric form is accepted too.
+    /// </summary>
+    public static LogLevel FromAppInsights(JsonElement data, LogLevel fallback = LogLevel.Information)
+    {
+        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty("severityLevel", out var value))
+        {
+            return fallback;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetInt32(out var level) => FromAppInsights(level, fallback),
+            JsonValueKind.String => value.GetString()?.ToLowerInvariant() switch
+            {
+                "verbose" => LogLevel.Debug,
+                "information" => LogLevel.Information,
+                "warning" => LogLevel.Warning,
+                "error" => LogLevel.Error,
+                "critical" => LogLevel.Critical,
+                _ => fallback,
+            },
+            _ => fallback,
+        };
+    }
+
+    /// <summary>
     /// AI severity levels: 0=Verbose, 1=Information, 2=Warning, 3=Error, 4=Critical.
     /// </summary>
-    public static LogLevel FromAppInsights(int? severityLevel)
+    public static LogLevel FromAppInsights(int? severityLevel, LogLevel fallback = LogLevel.Information)
     {
         return severityLevel switch
         {
@@ -21,7 +50,7 @@ public static class SeverityMap
             2 => LogLevel.Warning,
             3 => LogLevel.Error,
             4 => LogLevel.Critical,
-            _ => LogLevel.Information,
+            _ => fallback,
         };
     }
 }

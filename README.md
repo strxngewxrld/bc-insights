@@ -35,7 +35,7 @@ The OTLP resource of every item is derived per envelope:
 
 | Resource attribute                                    | Source                                                                    |
 | ----------------------------------------------------- | ------------------------------------------------------------------------- |
-| `host.name`                                           | URL `/<host>/…` › `ai.cloud.roleInstance` › `Resource:HostName` › caller IP |
+| `host.name`                                           | URL `/<host>/…` › `ai.cloud.roleInstance` › `ai.internal.nodeName` › `Resource:HostName` › caller IP |
 | `bc.server_instance`                                  | URL `/…/<instance>/` › `Resource:BcServerInstance`                         |
 | `service.instance.id`                                 | `<host>/<instance>`                                                       |
 | `service.name`, `service.namespace`                   | `Resource` defaults, overridable per source                               |
@@ -63,7 +63,7 @@ Tenant, company and environment are **record attributes** (`bc.tenant.id`,
 
 | AI `baseType`          | OTLP signal | Notes                                                        |
 | ---------------------- | ----------- | ------------------------------------------------------------ |
-| `MessageData`          | Log         | `severityLevel`→severity, `message`→body, `eventId`→`event.name` |
+| `MessageData`          | Log         | `severityLevel` (name or number)→severity, `message`→body, `eventId`→`event.name` |
 | `EventData`            | Log (Info)  | `name`→body                                                  |
 | `ExceptionData`        | Log (Error) | `exception.type` / `.message` / `.stacktrace`                |
 | `RequestData`          | Span/Server | duration, `http.response.status_code`, `url.full`, status    |
@@ -72,15 +72,22 @@ Tenant, company and environment are **record attributes** (`bc.tenant.id`,
 | *(anything else)*      | Log (Warn)  | flagged `telemetry.mapping.status=unsupported`, counted      |
 
 - **Original timestamps** are kept for every signal (logs included).
-- **Log ↔ trace correlation:** logs carry `traceId` (from `ai.operation.id`) and
-  `spanId` (from a valid `ai.operation.parentId`), so a BC operation's logs show
-  up next to its spans.
-- **Numeric dimensions:** BC durations (`"00:00:01.25"`) get a numeric companion
-  `<key>InMs` unless BC already sends one; `*InMs` and known counters
-  (`sqlExecutes`, `sqlRowsRead`, …) are exported as numbers, so they can be
+- **Log ↔ trace correlation:** a log carries `traceId`/`spanId` only when it
+  belongs to a span (valid `ai.operation.parentId`). BC on-premises reuses one
+  `ai.operation.id` across sessions, which would otherwise merge unrelated logs
+  into one trace; the id is always available as `bc.operation.id`.
+- **Numeric dimensions:** BC durations (`"00:00:01.25"`) are exported as numeric
+  `<key>InMs` (BC's own `*InMs` value wins); known counters (`sqlExecutes`,
+  `sqlRowsRead`, …) as integers and `True`/`False` as booleans, so they can be
   aggregated and filtered in the backend.
-- Custom dimensions are kept under their original keys; a known subset is
-  promoted to `bc.*` / semantic-convention keys.
+- **One key per value:** well-known dimensions are renamed (`companyName` →
+  `bc.company.name`, `aadTenantId` → `bc.tenant.id`, `clientType` →
+  `bc.client_type`, `componentVersion` → `bc.version`, `environmentType` →
+  `bc.environment.type`, `httpStatusCode` → `http.response.status_code`);
+  `eventId` is `event.name`. All other dimensions keep their BC names. Privacy
+  rules match the BC name as well as the exported name.
+- **Placeholders dropped:** BC's `"N/A"` (tags) and `"NaN"` (dimensions) are
+  treated as missing.
 
 ### Trace context
 
@@ -101,14 +108,23 @@ otherwise the span is a root span. A request's own 16-hex `id` becomes its span 
   for 408/429/502/503/504 and network errors (`Otlp:MaxRetrySeconds`); OTLP
   partial-success rejections are logged and counted.
 - **Attribute privacy** (`Telemetry`): allowlist / denylist / redaction / hashing.
-- **Observability of the proxy**: `GET /health` reports queue length, exported /
-  dropped / failed / rejected counts, last success and last error.
+- **Observability of the proxy**: `GET /health` reports `status` (`degraded`
+  while the latest export failed), queue length, exported / dropped / failed /
+  rejected counts, last success, last error and its time.
+- **Debug capture** (`Debug:CaptureDirectory`, off by default): writes raw BC
+  envelopes and the exported OTLP JSON to `capture-yyyyMMdd.ndjson` for mapping
+  checks; size-limited, unfiltered (may contain personal data).
+
+> **Availability matters:** BC does not buffer telemetry it cannot deliver. While
+> the proxy is unreachable, telemetry is lost (verified with BC 29). Run the proxy
+> close to BC (e.g. IIS on each BC server, `localhost`) and keep it always on.
 
 ## Repository layout
 
 ```
 src/BcTelemetryProxy/
   Configuration/  options (Ingestion, Otlp, Resource, Telemetry)
+  Diagnostics/    DebugCapture (optional raw/OTLP capture)
   Ingestion/      endpoints, envelope reader, limits, SourceResolver
   Mapping/        AiToOtelMapper + TraceContextMapper + AttributeMapper + MetricMapper
   Export/         OtlpExporter (queue, batching, retry) + OtlpJsonSerializer
@@ -116,7 +132,7 @@ src/BcTelemetryProxy/
 tests/BcTelemetryProxy.Tests/   xUnit unit + integration tests
 deploy/iis/                     IIS publish/host script
 deploy/otel-collector/          optional Collector (Windows Event Log, fan-out)
-samples/                        example BC /v2/track payload (NDJSON)
+samples/                        example /v2/track payload + real (sanitised) BC 29 envelope
 ```
 
 ## Build & test

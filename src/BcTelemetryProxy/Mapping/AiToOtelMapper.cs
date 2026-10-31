@@ -95,7 +95,7 @@ public sealed class AiToOtelMapper
     private void MapMessage(Envelope env, JsonElement data, TelemetrySource source)
     {
         EmitLog(env, source,
-            SeverityMap.FromAppInsights(data.GetIntOrNull("severityLevel")),
+            SeverityMap.FromAppInsights(data),
             body: data.GetStringOrNull("message"),
             eventName: data.GetCustomProperty("eventId"),
             attributes: BuildAttributes(env, data));
@@ -112,7 +112,7 @@ public sealed class AiToOtelMapper
 
     private void MapException(Envelope env, JsonElement data, TelemetrySource source)
     {
-        var level = SeverityMap.FromAppInsights(data.GetIntOrNull("severityLevel") ?? 3);
+        var level = SeverityMap.FromAppInsights(data, LogLevel.Error);
         var attributes = NewAttributeList(env, data);
         string? body = env.Name;
 
@@ -151,8 +151,10 @@ public sealed class AiToOtelMapper
     }
 
     /// <summary>
-    /// Logs keep the original BC timestamp and, when BC supplied an operation id,
-    /// the trace context, so logs and spans of one operation correlate.
+    /// Logs keep the original BC timestamp. Trace context is attached only when the
+    /// log belongs to a span (valid <c>ai.operation.parentId</c>): BC on-premises
+    /// reuses one <c>ai.operation.id</c> across sessions, which would otherwise glue
+    /// unrelated logs into one giant trace. The id is always kept as <c>bc.operation.id</c>.
     /// </summary>
     private void EmitLog(
         Envelope env,
@@ -162,10 +164,8 @@ public sealed class AiToOtelMapper
         string? eventName,
         IReadOnlyList<KeyValuePair<string, object?>> attributes)
     {
-        ActivityTraceId? traceId = string.IsNullOrWhiteSpace(env.OperationId)
-            ? null
-            : TraceContextMapper.ResolveTraceId(env.OperationId);
-        var spanId = traceId is null ? null : TraceContextMapper.ResolveParentSpanId(env.OperationParentId);
+        var spanId = env.OperationId is null ? null : TraceContextMapper.ResolveParentSpanId(env.OperationParentId);
+        ActivityTraceId? traceId = spanId is null ? null : TraceContextMapper.ResolveTraceId(env.OperationId);
 
         _emitter.EmitLog(new LogItem(source, env.TimestampUtc, level, body, eventName, traceId, spanId, attributes));
     }

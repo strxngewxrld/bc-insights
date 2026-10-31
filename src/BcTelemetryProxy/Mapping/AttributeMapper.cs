@@ -13,8 +13,8 @@ namespace BcTelemetryProxy.Mapping;
 /// privacy processing (allowlist / denylist / redaction / hashing) before the
 /// attributes leave the proxy.
 ///
-/// Standardised OpenTelemetry semantic-convention attributes and BC-specific
-/// <c>bc.*</c> attributes are emitted side by side and complement each other.
+/// Well-known BC dimensions are exported under OpenTelemetry semantic-convention
+/// or BC-specific <c>bc.*</c> keys; all other dimensions keep their BC names.
 /// </summary>
 public sealed class AttributeMapper
 {
@@ -34,74 +34,63 @@ public sealed class AttributeMapper
         _redactionMarker = o.RedactionMarker;
     }
 
-    /// <summary>Adds context attributes derived from the AI envelope tags.</summary>
+    /// <summary>
+    /// Adds context attributes derived from the AI envelope tags. Host and server
+    /// instance are resource attributes (see <c>SourceResolver</c>) and are not
+    /// repeated on every record.
+    /// </summary>
     public static void AddContext(List<KeyValuePair<string, object?>> target, Envelope env)
     {
-        // Standardised semantic conventions.
-        Add(target, "service.instance.id", env.CloudRoleInstance);
         Add(target, "enduser.id", env.UserId);
-
-        // BC-specific namespace (complements, does not replace, the above).
-        Add(target, "bc.server_instance", env.CloudRole);
         Add(target, "bc.operation.id", env.OperationId);
         Add(target, "bc.operation.name", env.OperationName);
         Add(target, "bc.session.id", env.SessionId);
     }
 
     /// <summary>
-    /// Adds the custom dimensions under their original keys and promotes a known
-    /// subset to <c>bc.*</c> / semantic-convention attributes.
+    /// Adds the custom dimensions. Well-known dimensions are renamed to
+    /// <c>bc.*</c> / semantic-convention keys (one key per value, no duplicates);
+    /// all others keep their original BC names. BC durations ("hh:mm:ss.fffffff")
+    /// become numeric <c>&lt;key&gt;InMs</c> attributes, counters become integers and
+    /// "True"/"False" become booleans, so backends can aggregate and filter on them.
     /// </summary>
     public static void AddCustomProperties(List<KeyValuePair<string, object?>> target, JsonElement data)
     {
         var properties = data.EnumerateCustomProperties().ToList();
         var keys = new HashSet<string>(properties.Select(p => p.Key), StringComparer.OrdinalIgnoreCase);
+        var written = new HashSet<string>(target.Select(a => a.Key), StringComparer.Ordinal);
 
         foreach (var (key, value) in properties)
         {
-            if (string.IsNullOrEmpty(value))
+            if (Envelope.IsPlaceholder(value) || DroppedKeys.Contains(key))
             {
                 continue;
             }
 
-            target.Add(new(key, TypedValue(key, value)));
-
-            // BC reports durations as "hh:mm:ss.fffffff"; add a numeric companion
-            // (unless BC already sent one) so backends can aggregate and filter on it.
-            var msKey = key + "InMs";
-            if (!keys.Contains(msKey) &&
-                value.Contains(':') &&
+            if (value!.Contains(':') &&
                 TimeSpan.TryParseExact(value, "c", CultureInfo.InvariantCulture, out var duration))
             {
-                target.Add(new(msKey, duration.TotalMilliseconds));
+                // Keep BC's own numeric companion when it sends one.
+                if (!keys.Contains(key + "InMs"))
+                {
+                    AddOnce(target, written, key + "InMs", duration.TotalMilliseconds);
+                }
+
+                continue;
             }
 
-            switch (key)
+            if (key.Equals("httpStatusCode", StringComparison.OrdinalIgnoreCase))
             {
-                case "companyName":
-                    Add(target, "bc.company.name", value);
-                    break;
-                case "aadTenantId":
-                case "tenantId":
-                    Add(target, "bc.tenant.id", value);
-                    break;
-                case "environmentName":
-                    Add(target, "bc.environment", value);
-                    break;
-                case "environmentType":
-                    Add(target, "bc.environment.type", value);
-                    break;
-                case "componentVersion":
-                case "serverExecutableVersion":
-                    Add(target, "bc.version", value);
-                    break;
-                case "clientType":
-                    Add(target, "bc.client_type", value);
-                    break;
-                case "httpStatusCode":
+                if (written.Add("http.response.status_code"))
+                {
                     AddStatusCode(target, value);
-                    break;
+                }
+
+                continue;
             }
+
+            var name = PromotedKeys.TryGetValue(key, out var promoted) ? promoted : key;
+            AddOnce(target, written, name, TypedValue(key, value));
         }
     }
 
@@ -120,11 +109,16 @@ public sealed class AttributeMapper
 
     /// <summary>
     /// Known numeric BC dimensions (counters and <c>*InMs</c> durations) are
-    /// exported as numbers; everything else stays a string so a key never
-    /// changes type between records.
+    /// exported as numbers and "True"/"False" as booleans; everything else stays
+    /// a string so a key never changes type between records.
     /// </summary>
     private static object TypedValue(string key, string value)
     {
+        if (value is "True" or "False")
+        {
+            return value == "True";
+        }
+
         var numeric = key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase) || NumericKeys.Contains(key);
         if (!numeric)
         {
@@ -139,11 +133,40 @@ public sealed class AttributeMapper
         return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : value;
     }
 
+    private static void AddOnce(List<KeyValuePair<string, object?>> target, HashSet<string> written, string key, object value)
+    {
+        if (written.Add(key))
+        {
+            target.Add(new(key, value));
+        }
+    }
+
     private static readonly HashSet<string> NumericKeys = new(StringComparer.OrdinalIgnoreCase)
     {
         "sqlExecutes", "sqlRowsRead", "sqlStatementsExecuted", "totalRows", "rowsAffected",
         "httpStatusCode", "numberOfJoins", "numberOfRecords", "retryCount", "alStackDepth",
     };
+
+    /// <summary>BC dimension -> exported key. Privacy rules match either name.</summary>
+    private static readonly Dictionary<string, string> PromotedKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["companyName"] = "bc.company.name",
+        ["aadTenantId"] = "bc.tenant.id",
+        ["tenantId"] = "bc.tenant.id",
+        ["environmentName"] = "bc.environment",
+        ["environmentType"] = "bc.environment.type",
+        ["componentVersion"] = "bc.version",
+        ["serverExecutableVersion"] = "bc.version",
+        ["clientType"] = "bc.client_type",
+        ["httpStatusCode"] = "http.response.status_code",
+    };
+
+    /// <summary>Exported elsewhere: <c>eventId</c> is the record's <c>event.name</c>.</summary>
+    private static readonly HashSet<string> DroppedKeys = new(StringComparer.OrdinalIgnoreCase) { "eventId" };
+
+    private static readonly Dictionary<string, string[]> OriginalKeys = PromotedKeys
+        .GroupBy(p => p.Value)
+        .ToDictionary(g => g.Key, g => g.Select(p => p.Key).ToArray());
 
     /// <summary>
     /// Applies the configured privacy rules. Returns a new list containing only
@@ -154,21 +177,21 @@ public sealed class AttributeMapper
         var result = new List<KeyValuePair<string, object?>>(attributes.Count);
         foreach (var attribute in attributes)
         {
-            if (_denied.Contains(attribute.Key))
+            if (Matches(_denied, attribute.Key))
             {
                 continue;
             }
 
-            if (_allowed.Count > 0 && !_allowed.Contains(attribute.Key))
+            if (_allowed.Count > 0 && !Matches(_allowed, attribute.Key))
             {
                 continue;
             }
 
-            if (_redacted.Contains(attribute.Key))
+            if (Matches(_redacted, attribute.Key))
             {
                 result.Add(new(attribute.Key, _redactionMarker));
             }
-            else if (_hashed.Contains(attribute.Key))
+            else if (Matches(_hashed, attribute.Key))
             {
                 result.Add(new(attribute.Key, Hash(attribute.Value)));
             }
@@ -181,9 +204,29 @@ public sealed class AttributeMapper
         return result;
     }
 
+    /// <summary>
+    /// A rule matches the exported key, the original BC dimension it was renamed
+    /// from, or (for <c>&lt;key&gt;InMs</c> durations) the original duration key.
+    /// </summary>
+    private static bool Matches(HashSet<string> rules, string key)
+    {
+        if (rules.Count == 0)
+        {
+            return false;
+        }
+
+        if (rules.Contains(key) ||
+            (OriginalKeys.TryGetValue(key, out var originals) && originals.Any(rules.Contains)))
+        {
+            return true;
+        }
+
+        return key.EndsWith("InMs", StringComparison.Ordinal) && rules.Contains(key[..^4]);
+    }
+
     private static void Add(List<KeyValuePair<string, object?>> target, string key, string? value)
     {
-        if (!string.IsNullOrEmpty(value))
+        if (!Envelope.IsPlaceholder(value))
         {
             target.Add(new(key, value));
         }

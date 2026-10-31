@@ -8,6 +8,19 @@ using Microsoft.Extensions.Logging;
 
 namespace BcTelemetryProxy.Export;
 
+/// <summary>Writer settings shared by the exporter and the debug capture.</summary>
+public static class OtlpJson
+{
+    /// <summary>
+    /// Non-ASCII text (umlauts in BC messages) is written as UTF-8 instead of
+    /// \uXXXX escapes; the output is never embedded in HTML.
+    /// </summary>
+    public static readonly JsonWriterOptions WriterOptions = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+}
+
 /// <summary>
 /// Writes OTLP/JSON export requests (opentelemetry-proto, JSON mapping: hex trace
 /// and span ids, 64-bit integers as strings). Items are grouped by

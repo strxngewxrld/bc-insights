@@ -8,8 +8,8 @@ namespace BcTelemetryProxy.Ingestion;
 /// <summary>
 /// Determines the <see cref="TelemetrySource"/> (OTLP resource) of an envelope.
 ///
-/// Host:     URL segment &gt; <c>ai.cloud.roleInstance</c> &gt; configured HostName
-///           &gt; caller address (the proxy's machine name for loopback callers).
+/// Host:     URL segment &gt; <c>ai.cloud.roleInstance</c> &gt; <c>ai.internal.nodeName</c>
+///           (first DNS label) &gt; configured HostName &gt; caller address (the proxy's machine name for loopback callers).
 /// Instance: URL segment &gt; configured BcServerInstance.
 ///
 /// The recommended setup encodes both in the BC connection string, e.g.
@@ -46,7 +46,8 @@ public sealed class SourceResolver
     public TelemetrySource Resolve(string? routeHost, string? routeInstance, Envelope envelope, IPAddress? caller)
     {
         var host = routeHost
-            ?? NullIfEmpty(envelope.CloudRoleInstance)
+            ?? HostLabel(envelope.CloudRoleInstance)
+            ?? HostLabel(envelope.NodeName)
             ?? _options.HostName
             ?? CallerHost(caller);
         var instance = routeInstance ?? _options.BcServerInstance;
@@ -90,5 +91,10 @@ public sealed class SourceResolver
         return caller is null || IPAddress.IsLoopback(caller) ? Environment.MachineName : caller.ToString();
     }
 
-    private static string? NullIfEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+    /// <summary>"SRV01.corp.local" -> "SRV01", so tag-derived hosts match the URL convention.</summary>
+    private static string? HostLabel(string? value)
+    {
+        var label = value?.Split('.', 2)[0];
+        return IsValidSegment(label) ? label : null;
+    }
 }

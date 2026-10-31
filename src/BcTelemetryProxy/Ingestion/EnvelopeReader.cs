@@ -24,7 +24,11 @@ public enum EnvelopeItemStatus
     TooLarge,
 }
 
-public sealed record EnvelopeReadItem(int Index, Envelope? Envelope, EnvelopeItemStatus Status);
+public sealed record EnvelopeReadItem(int Index, Envelope? Envelope, EnvelopeItemStatus Status)
+{
+    /// <summary>The raw NDJSON line; only kept when the caller asks for it (debug capture).</summary>
+    public string? Raw { get; init; }
+}
 
 public sealed record EnvelopeReadResult(ReadOutcome Outcome, IReadOnlyList<EnvelopeReadItem> Items);
 
@@ -47,7 +51,8 @@ public static class EnvelopeReader
         Stream body,
         bool gzip,
         IngestionOptions options,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool keepRaw = false)
     {
         var items = new List<EnvelopeReadItem>();
 
@@ -74,11 +79,15 @@ public static class EnvelopeReader
 
                 if (Encoding.UTF8.GetByteCount(line) > options.MaxEnvelopeBytes)
                 {
-                    items.Add(new EnvelopeReadItem(index++, null, EnvelopeItemStatus.TooLarge));
+                    items.Add(new EnvelopeReadItem(index++, null, EnvelopeItemStatus.TooLarge)
+                    {
+                        Raw = keepRaw ? line[..Math.Min(line.Length, 4096)] : null,
+                    });
                     continue;
                 }
 
-                items.Add(ParseLine(line, index++));
+                var item = ParseLine(line, index++);
+                items.Add(keepRaw ? item with { Raw = line } : item);
             }
         }
         catch (StreamLimitExceededException ex)

@@ -37,8 +37,14 @@ public sealed class Envelope
     public string? OperationName => Tag("ai.operation.name");
     public string? UserId => Tag("ai.user.id");
     public string? SessionId => Tag("ai.session.id");
+    public string? NodeName => Tag("ai.internal.nodeName");
 
-    public string? Tag(string key) => Tags.TryGetValue(key, out var v) ? v : null;
+    /// <summary>Tag value, or null when absent or a BC placeholder such as "N/A".</summary>
+    public string? Tag(string key) => Tags.TryGetValue(key, out var v) && !IsPlaceholder(v) ? v : null;
+
+    /// <summary>Business Central fills unknown values with "N/A" (tags) or "NaN" (dimensions).</summary>
+    public static bool IsPlaceholder(string? value)
+        => string.IsNullOrWhiteSpace(value) || value is "N/A" or "NaN";
 }
 
 public sealed class EnvelopeData

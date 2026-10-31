@@ -50,12 +50,14 @@ public class PrivacyTests
         });
 
         mapper.Map(TestFactory.ParseEnvelope("""
-        {"data":{"baseType":"MessageData","baseData":{"message":"m","properties":{"companyName":"CRONUS","eventId":"RT0005"}}}}
+        {"data":{"baseType":"MessageData","baseData":{"message":"m","properties":{"companyName":"CRONUS","sqlExecutes":"3"}}}}
         """));
 
+        // A rule on the BC dimension name also covers its renamed export key.
         var log = Assert.Single(emitter.Logs);
         Assert.False(log.Attributes.ContainsKey("companyName"));
-        Assert.True(log.Attributes.ContainsKey("eventId"));
+        Assert.False(log.Attributes.ContainsKey("bc.company.name"));
+        Assert.True(log.Attributes.ContainsKey("sqlExecutes"));
     }
 
     [Fact]
@@ -64,16 +66,15 @@ public class PrivacyTests
         var emitter = new RecordingEmitter();
         var mapper = TestFactory.Mapper(emitter, new TelemetryPrivacyOptions
         {
-            AllowedAttributes = { "eventId" },
+            AllowedAttributes = { "sqlExecutes", "executionTime" },
         });
 
         mapper.Map(TestFactory.ParseEnvelope("""
-        {"tags":{"ai.cloud.role":"BC"},"data":{"baseType":"MessageData","baseData":{"message":"m","properties":{"companyName":"CRONUS","eventId":"RT0005"}}}}
+        {"tags":{"ai.session.id":"s1"},"data":{"baseType":"MessageData","baseData":{"message":"m","properties":{
+          "companyName":"CRONUS","sqlExecutes":"3","executionTime":"00:00:01"}}}}
         """));
 
         var log = Assert.Single(emitter.Logs);
-        Assert.True(log.Attributes.ContainsKey("eventId"));
-        Assert.False(log.Attributes.ContainsKey("companyName"));
-        Assert.False(log.Attributes.ContainsKey("bc.server_instance"));
+        Assert.Equal(new[] { "executionTimeInMs", "sqlExecutes" }, log.Attributes.Keys.OrderBy(k => k));
     }
 }

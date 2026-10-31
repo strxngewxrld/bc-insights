@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Threading.Channels;
 using BcTelemetryProxy.Configuration;
+using BcTelemetryProxy.Diagnostics;
 using BcTelemetryProxy.Mapping;
 using BcTelemetryProxy.Model;
 using Microsoft.Extensions.Options;
@@ -28,11 +29,17 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
     private readonly Uri _tracesUri;
     private readonly Uri _metricsUri;
     private readonly ExportStatistics _stats = new();
+    private readonly DebugCapture? _capture;
 
-    public OtlpExporter(IOptions<OtlpOptions> options, ILogger<OtlpExporter> logger, HttpMessageHandler? handler = null)
+    public OtlpExporter(
+        IOptions<OtlpOptions> options,
+        ILogger<OtlpExporter> logger,
+        HttpMessageHandler? handler = null,
+        DebugCapture? capture = null)
     {
         _options = options.Value;
         _logger = logger;
+        _capture = capture;
         _queue = Channel.CreateBounded<object>(new BoundedChannelOptions(_options.MaxQueueSize)
         {
             FullMode = BoundedChannelFullMode.DropWrite,
@@ -168,6 +175,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
     private async Task ExportAsync(string signal, Uri uri, int count, Action<Utf8JsonWriter> write, bool retry, CancellationToken ct)
     {
         var payload = Serialize(write);
+        _capture?.CaptureExport(signal, write);
         var deadline = DateTime.UtcNow.AddSeconds(_options.MaxRetrySeconds);
         var delay = TimeSpan.FromSeconds(1);
 
@@ -211,7 +219,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
                 error = ex.Message;
             }
 
-            _stats.LastError = $"{signal}: {error}";
+            _stats.RecordError($"{signal}: {error}");
             var wait = retryAfter is { } ra && ra < TimeSpan.FromMinutes(1) ? ra : delay;
             if (!retry || DateTime.UtcNow + wait > deadline)
             {
@@ -230,7 +238,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
     {
         using var buffer = new MemoryStream();
         using (Stream target = _options.Compression ? new GZipStream(buffer, CompressionLevel.Fastest, leaveOpen: true) : buffer)
-        using (var writer = new Utf8JsonWriter(target))
+        using (var writer = new Utf8JsonWriter(target, OtlpJson.WriterOptions))
         {
             write(writer);
         }
@@ -266,7 +274,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
             if (rejected > 0 || !string.IsNullOrEmpty(message))
             {
                 Interlocked.Add(ref _stats.Rejected, rejected);
-                _stats.LastError = $"{signal}: backend rejected {rejected} item(s): {message}";
+                _stats.RecordError($"{signal}: backend rejected {rejected} item(s): {message}");
                 _logger.LogWarning("OTLP {Signal} partial success: {Rejected} rejected ({Message})", signal, rejected, message);
             }
         }
@@ -279,7 +287,7 @@ public sealed class OtlpExporter : BackgroundService, IOtelEmitter
     private void Fail(string signal, int count, string error, bool retried)
     {
         Interlocked.Add(ref _stats.Failed, count);
-        _stats.LastError = $"{signal}: {error}";
+        _stats.RecordError($"{signal}: {error}");
         _logger.LogError("OTLP {Signal} export failed{Retried}, dropping {Count} item(s): {Error}",
             signal, retried ? " after retries" : string.Empty, count, error);
     }
@@ -301,9 +309,20 @@ public sealed class ExportStatistics
     public long ExportedSpans;
     public long ExportedMetrics;
 
-    public string? LastError { get; set; }
+    public string? LastError { get; private set; }
+
+    public DateTime? LastErrorUtc { get; private set; }
 
     public DateTime? LastSuccessUtc { get; private set; }
+
+    /// <summary>True while the most recent export attempt failed (or nothing succeeded yet after an error).</summary>
+    public bool IsDegraded => LastErrorUtc is { } error && (LastSuccessUtc is not { } success || error > success);
+
+    public void RecordError(string error)
+    {
+        LastError = error;
+        LastErrorUtc = DateTime.UtcNow;
+    }
 
     public void RecordSuccess(string signal, int count)
     {

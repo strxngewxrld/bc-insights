@@ -17,6 +17,7 @@ public static class TraceContextMapper
     /// Resolves the trace id for an operation:
     /// <list type="bullet">
     /// <item>a valid 32-hex W3C trace id is used unchanged,</item>
+    /// <item>a GUID is used as its 32 hex digits,</item>
     /// <item>any other non-empty id is deterministically hashed (SHA-256, first
     /// 16 bytes) so equal ids always yield the same trace id and different ids
     /// effectively never collide,</item>
@@ -33,6 +34,13 @@ public static class TraceContextMapper
         if (IsValidTraceId(operationId))
         {
             return ActivityTraceId.CreateFromString(operationId.AsSpan());
+        }
+
+        // BC sends GUIDs ("4205630c-2e82-..."); their 32 hex digits are a valid
+        // trace id, which keeps the id recognisable in the backend.
+        if (Guid.TryParse(operationId, out var guid) && guid != Guid.Empty)
+        {
+            return ActivityTraceId.CreateFromString(guid.ToString("N").AsSpan());
         }
 
         Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];

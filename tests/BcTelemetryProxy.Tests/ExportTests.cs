@@ -117,7 +117,8 @@ public class MapperEnrichmentTests
         """));
 
         var a = Assert.Single(_emitter.Logs).Attributes;
-        Assert.Equal("00:00:01.2500000", a["executionTime"]);
+        Assert.False(a.ContainsKey("executionTime"));
+        Assert.False(a.ContainsKey("serverExecutionTime"));
         Assert.Equal(1250d, a["executionTimeInMs"]);
         Assert.Equal(500L, a["serverExecutionTimeInMs"]);
         Assert.Equal(12L, a["sqlExecutes"]);

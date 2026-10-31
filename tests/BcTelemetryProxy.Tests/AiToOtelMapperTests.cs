@@ -25,11 +25,13 @@ public class AiToOtelMapperTests
         Assert.Equal(LogLevel.Warning, log.Level);
         Assert.Equal("hello", log.Body);
         Assert.Equal("RT0005", log.EventName);
-        Assert.Equal("RT0005", log.Attributes["eventId"]);
-        Assert.Equal("CRONUS", log.Attributes["companyName"]);
         Assert.Equal("CRONUS", log.Attributes["bc.company.name"]);
-        Assert.Equal("BC", log.Attributes["bc.server_instance"]);
         Assert.Equal("0123456789abcdef0123456789abcdef", log.Attributes["bc.operation.id"]);
+
+        // Renamed, not duplicated; eventId travels as event.name; host/instance are resource attributes.
+        Assert.False(log.Attributes.ContainsKey("companyName"));
+        Assert.False(log.Attributes.ContainsKey("eventId"));
+        Assert.False(log.Attributes.ContainsKey("bc.server_instance"));
     }
 
     [Fact]
@@ -92,7 +94,7 @@ public class AiToOtelMapperTests
     {
         var env = TestFactory.ParseEnvelope("""
         {"time":"2026-07-10T08:15:33Z","tags":{"ai.cloud.role":"BC"},
-         "data":{"baseType":"MetricData","baseData":{"metrics":[{"name":"Server sessions","value":42,"count":1}],"properties":{"eventId":"RT0009"}}}}
+         "data":{"baseType":"MetricData","baseData":{"metrics":[{"name":"Server sessions","value":42,"count":1}],"properties":{"eventId":"RT0009","companyName":"CRONUS"}}}}
         """);
 
         _mapper.Map(env);
@@ -100,7 +102,7 @@ public class AiToOtelMapperTests
         var metric = Assert.Single(_emitter.Metrics);
         Assert.Equal("Server sessions", metric.Point.Name);
         Assert.Equal(42, metric.Point.Value);
-        Assert.Equal("BC", metric.Tags["bc.server_instance"]);
+        Assert.Equal("CRONUS", metric.Tags["bc.company.name"]);
     }
 
     [Fact]
