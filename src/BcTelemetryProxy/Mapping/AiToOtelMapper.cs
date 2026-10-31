@@ -1,8 +1,12 @@
 ﻿using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using BcTelemetryProxy.Configuration;
 using BcTelemetryProxy.Model;
+using BcTelemetryProxy.Support;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace BcTelemetryProxy.Mapping;
 
@@ -28,18 +32,38 @@ public enum MappingStatus
 ///   MetricData           -> metric
 ///   (anything else)      -> explicit "unsupported" log, counted
 /// </summary>
-public sealed class AiToOtelMapper
+public sealed partial class AiToOtelMapper
 {
     private readonly IOtelEmitter _emitter;
     private readonly AttributeMapper _attributes;
     private readonly ILogger<AiToOtelMapper> _logger;
+    private readonly MappingOptions _mapping;
+    private readonly HashSet<string> _databaseEvents;
+    private readonly HashSet<string> _outgoingEvents;
+    private readonly string[] _durationKeys;
+    private readonly ErrorRegistry? _errors;
+    private readonly bool _logNewErrors;
     private long _unsupportedCount;
 
-    public AiToOtelMapper(IOtelEmitter emitter, AttributeMapper attributes, ILogger<AiToOtelMapper> logger)
+    public AiToOtelMapper(
+        IOtelEmitter emitter,
+        AttributeMapper attributes,
+        ILogger<AiToOtelMapper> logger,
+        IOptions<MappingOptions>? mapping = null,
+        ErrorRegistry? errors = null,
+        IOptions<SupportOptions>? support = null)
     {
         _emitter = emitter;
         _attributes = attributes;
         _logger = logger;
+        _mapping = mapping?.Value ?? new MappingOptions();
+        _errors = errors;
+        _logNewErrors = support?.Value.LogNewErrors ?? true;
+        _databaseEvents = new HashSet<string>(_mapping.DatabaseEvents, StringComparer.OrdinalIgnoreCase);
+        _outgoingEvents = new HashSet<string>(_mapping.OutgoingEvents, StringComparer.OrdinalIgnoreCase);
+
+        // Configuration binding appends list entries to the defaults; keep each key once.
+        _durationKeys = _mapping.DurationDimensions.Distinct(StringComparer.Ordinal).ToArray();
     }
 
     /// <summary>Total number of unsupported telemetry items seen since start.</summary>
@@ -94,20 +118,301 @@ public sealed class AiToOtelMapper
 
     private void MapMessage(Envelope env, JsonElement data, TelemetrySource source)
     {
-        EmitLog(env, source,
+        EmitLogAndDerivedSpan(env, data, source,
             SeverityMap.FromAppInsights(data),
             body: data.GetStringOrNull("message"),
-            eventName: data.GetCustomProperty("eventId"),
-            attributes: BuildAttributes(env, data));
+            eventName: data.GetCustomProperty("eventId"));
     }
 
     private void MapEvent(Envelope env, JsonElement data, TelemetrySource source)
     {
-        EmitLog(env, source,
+        EmitLogAndDerivedSpan(env, data, source,
             LogLevel.Information,
             body: data.GetStringOrNull("name") ?? env.Name,
-            eventName: data.GetCustomProperty("eventId") ?? data.GetStringOrNull("name"),
-            attributes: BuildAttributes(env, data));
+            eventName: data.GetCustomProperty("eventId") ?? data.GetStringOrNull("name"));
+    }
+
+    /// <summary>
+    /// Emits the log and, for events that carry a duration or report an error, a
+    /// span (BC logs at the end of an operation). Errors carry an <c>exception</c>
+    /// span event, which feeds exception views, and a <c>bc.error.fingerprint</c>.
+    /// The log is linked to that span; all of it shares the operation's trace.
+    /// </summary>
+    private void EmitLogAndDerivedSpan(
+        Envelope env,
+        JsonElement data,
+        TelemetrySource source,
+        LogLevel level,
+        string? body,
+        string? eventName,
+        IReadOnlyList<KeyValuePair<string, object?>>? attributes = null,
+        ExceptionInfo? exception = null)
+    {
+        attributes ??= BuildAttributes(env, data);
+        string? errorType = null;
+        if (eventName is not null && _mapping.ErrorEvents.TryGetValue(eventName, out errorType) && level < LogLevel.Error)
+        {
+            level = LogLevel.Error;
+        }
+
+        var duration = _mapping.DeriveSpans ? EventDuration(data) : null;
+        var failed = _mapping.DeriveSpans && level >= LogLevel.Error;
+        if (duration is null && !failed)
+        {
+            EmitLog(env, source, level, body, eventName, attributes);
+            return;
+        }
+
+        var parent = TraceContextMapper.ResolveParentSpanId(env.OperationParentId);
+        var traceId = parent is null ? OperationTraceId(env) ?? ActivityTraceId.CreateRandom() : TraceContextMapper.ResolveTraceId(env.OperationId);
+        var spanId = ActivitySpanId.CreateRandom();
+
+        var (kind, extra) = SpanShape(eventName, data, source);
+        if (duration is null && kind == ActivityKind.Server)
+        {
+            kind = ActivityKind.Internal;
+        }
+
+        var spanAttributes = new List<KeyValuePair<string, object?>>(attributes);
+        if (eventName is not null)
+        {
+            spanAttributes.Add(new("bc.event.id", eventName));
+        }
+
+        spanAttributes.AddRange(extra);
+
+        SpanEvent[]? events = null;
+        if (failed)
+        {
+            exception ??= new ExceptionInfo(
+                errorType ?? data.GetCustomProperty("failureReason") ?? eventName ?? "BusinessCentralError",
+                data.GetCustomProperty("alErrorMessage") ?? body,
+                data.GetCustomProperty("alStackTrace"));
+            events = new[] { exception.ToEvent(env.TimestampUtc) };
+
+            var fingerprint = ErrorRegistry.Fingerprint(
+                eventName, exception.Type, data.GetCustomProperty("alObjectType"), data.GetCustomProperty("alObjectId"),
+                data.GetCustomProperty("extensionId"), SpanName(exception.Message, null));
+            spanAttributes.Add(new("bc.error.fingerprint", fingerprint));
+            attributes = new List<KeyValuePair<string, object?>>(attributes) { new("bc.error.fingerprint", fingerprint) };
+            RecordError(source, fingerprint, exception, eventName, env.TimestampUtc, traceId, spanAttributes);
+        }
+
+        var length = duration ?? TimeSpan.Zero;
+        _emitter.EmitSpan(new SpanItem(
+            source,
+            Name: SpanName(body, eventName),
+            Kind: kind,
+            StartUtc: env.TimestampUtc - length,
+            Duration: length,
+            TraceId: traceId,
+            SpanId: spanId,
+            ParentSpanId: parent,
+            Success: IsSuccess(level, data),
+            StatusDescription: data.GetCustomProperty("failureReason") ?? data.GetCustomProperty("result") ?? exception?.Type,
+            Attributes: spanAttributes,
+            Events: events));
+
+        _emitter.EmitLog(new LogItem(source, env.TimestampUtc, level, body, eventName, traceId, spanId, attributes));
+    }
+
+    /// <summary>
+    /// Trace of the BC operation (<c>ai.operation.id</c>, one per client action,
+    /// web service call or task), so its events end up in one trace.
+    /// </summary>
+    private ActivityTraceId? OperationTraceId(Envelope env)
+        => _mapping.CorrelateOperations && env.OperationId is { } operation
+            ? TraceContextMapper.ResolveTraceId(operation)
+            : null;
+
+    /// <summary>
+    /// Counts the error for support reports; the first occurrence of a kind also
+    /// becomes a <c>bc.error.first_seen</c> log (alert: "new error").
+    /// </summary>
+    private void RecordError(
+        TelemetrySource source,
+        string fingerprint,
+        ExceptionInfo exception,
+        string? eventName,
+        DateTime timeUtc,
+        ActivityTraceId traceId,
+        IReadOnlyList<KeyValuePair<string, object?>> attributes)
+    {
+        if (_errors?.Record(source, fingerprint, exception.Type, exception.Message, eventName, timeUtc, traceId, attributes, exception.StackTrace) != true ||
+            !_logNewErrors)
+        {
+            return;
+        }
+
+        var first = new List<KeyValuePair<string, object?>>
+        {
+            new("bc.error.fingerprint", fingerprint),
+            new("exception.type", exception.Type),
+        };
+        if (eventName is not null)
+        {
+            first.Add(new("bc.event.id", eventName));
+        }
+
+        foreach (var key in new[] { "extensionName", "extensionPublisher", "extensionVersion", "alObjectType", "alObjectId", "alObjectName" })
+        {
+            if (attributes.FirstOrDefault(a => a.Key == key).Value is { } value)
+            {
+                first.Add(new(key, value));
+            }
+        }
+
+        _emitter.EmitLog(new LogItem(source, timeUtc, LogLevel.Warning,
+            $"New error: {exception.Type}: {FirstLine(exception.Message)}", "bc.error.first_seen", traceId, null, _attributes.Filter(first)));
+    }
+
+    private static string? FirstLine(string? text)
+    {
+        var line = text?.Split('\n', 2)[0].Trim();
+        return line is { Length: > 200 } ? line[..200] : line;
+    }
+
+    private TimeSpan? EventDuration(JsonElement data)
+    {
+        foreach (var key in _durationKeys)
+        {
+            var value = data.GetCustomProperty(key);
+            if (value is null)
+            {
+                continue;
+            }
+
+            // e.g. alJobQueueExecutionTimeInMs = "88" (which would also parse as 88 days)
+            if (key.EndsWith("InMs", StringComparison.Ordinal))
+            {
+                if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var ms) && ms >= 0)
+                {
+                    return TimeSpan.FromMilliseconds(ms);
+                }
+
+                continue;
+            }
+
+            if (TimeSpan.TryParseExact(value, "c", CultureInfo.InvariantCulture, out var duration) && duration >= TimeSpan.Zero)
+            {
+                return duration;
+            }
+        }
+
+        return null;
+    }
+
+    private (ActivityKind Kind, List<KeyValuePair<string, object?>> Attributes) SpanShape(string? eventName, JsonElement data, TelemetrySource source)
+    {
+        var extra = new List<KeyValuePair<string, object?>>();
+        if (eventName is not null && _databaseEvents.Contains(eventName))
+        {
+            // Client span to the database tier; the server comes from the instance's
+            // CustomSettings.config or Resource attributes (bc.database.server/name).
+            extra.Add(new("db.system.name", "microsoft.sql_server"));
+            extra.Add(new("db.system", "mssql"));
+            extra.Add(new("peer.service", _mapping.DatabaseServiceName));
+            if (source.Attributes.TryGetValue("bc.database.server", out var server))
+            {
+                extra.Add(new("server.address", server.Split('\\', ',')[0]));
+                extra.Add(new("db.instance", server));
+            }
+
+            if (source.Attributes.TryGetValue("bc.database.name", out var database))
+            {
+                extra.Add(new("db.namespace", database));
+                extra.Add(new("db.name", database));
+            }
+
+            return (ActivityKind.Client, extra);
+        }
+
+        if (eventName is not null && _outgoingEvents.Contains(eventName))
+        {
+            var endpoint = data.GetCustomProperty("endpoint");
+            if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+            {
+                extra.Add(new("server.address", uri.Host));
+                extra.Add(new("server.port", (long)uri.Port));
+            }
+
+            var method = data.GetCustomProperty("httpMethod");
+            if (!string.IsNullOrEmpty(method))
+            {
+                extra.Add(new("http.request.method", method));
+            }
+
+            return (ActivityKind.Client, extra);
+        }
+
+        return (ActivityKind.Server, extra);
+    }
+
+    /// <summary>A failing result, an HTTP 5xx or an error-level event marks the span as failed.</summary>
+    private static bool IsSuccess(LogLevel level, JsonElement data)
+    {
+        if (level >= LogLevel.Error)
+        {
+            return false;
+        }
+
+        var result = data.GetCustomProperty("result");
+        if (!string.IsNullOrEmpty(result) && !Envelope.IsPlaceholder(result) &&
+            !result.Equals("Success", StringComparison.OrdinalIgnoreCase) &&
+            !result.Equals("OK", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return !(int.TryParse(data.GetCustomProperty("httpStatusCode"), out var status) && status >= 500);
+    }
+
+    /// <summary>
+    /// Span names group operations, so they must have low cardinality: ids in BC
+    /// messages ("Task 1132…-…f created: 448 …", "Job queue entry finished: 8C8F…")
+    /// are replaced by placeholders; the values stay in the attributes.
+    /// </summary>
+    public static string SpanName(string? body, string? eventName)
+    {
+        var name = string.IsNullOrWhiteSpace(body) ? eventName ?? "bc.event" : body.Trim();
+        var newline = name.IndexOfAny(new[] { '\r', '\n' });
+        if (newline > 0)
+        {
+            name = name[..newline];
+        }
+
+        name = GuidPattern().Replace(name, "{id}");
+        name = TimestampPattern().Replace(name, "{time}");
+        name = NumberPattern().Replace(name, "{n}");
+        return name.Length <= 120 ? name : name[..120];
+    }
+
+    [GeneratedRegex(@"\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?")]
+    private static partial Regex GuidPattern();
+
+    [GeneratedRegex(@"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?")]
+    private static partial Regex TimestampPattern();
+
+    [GeneratedRegex(@"(?<![\w.])\d+(\.\d+)*(?![\w.])")]
+    private static partial Regex NumberPattern();
+
+    private sealed record ExceptionInfo(string Type, string? Message, string? StackTrace)
+    {
+        public SpanEvent ToEvent(DateTime timeUtc)
+        {
+            var attributes = new List<KeyValuePair<string, object?>> { new("exception.type", Type) };
+            if (!string.IsNullOrEmpty(Message))
+            {
+                attributes.Add(new("exception.message", Message));
+            }
+
+            if (!string.IsNullOrEmpty(StackTrace))
+            {
+                attributes.Add(new("exception.stacktrace", StackTrace));
+            }
+
+            return new SpanEvent("exception", timeUtc, attributes);
+        }
     }
 
     private void MapException(Envelope env, JsonElement data, TelemetrySource source)
@@ -115,6 +420,7 @@ public sealed class AiToOtelMapper
         var level = SeverityMap.FromAppInsights(data, LogLevel.Error);
         var attributes = NewAttributeList(env, data);
         string? body = env.Name;
+        string? type = null, message = null, stack = null;
 
         if (data.ValueKind == JsonValueKind.Object &&
             data.TryGetProperty("exceptions", out var exceptions) &&
@@ -122,17 +428,19 @@ public sealed class AiToOtelMapper
             exceptions.GetArrayLength() > 0)
         {
             var first = exceptions[0];
-            var type = first.GetStringOrNull("typeName");
-            var message = first.GetStringOrNull("message");
-            var stack = first.GetStringOrNull("stack") ?? first.GetStringOrNull("parsedStack");
+            type = first.GetStringOrNull("typeName");
+            message = first.GetStringOrNull("message");
+            stack = first.GetStringOrNull("stack") ?? first.GetStringOrNull("parsedStack");
             body = message ?? type;
             AddTag(attributes, "exception.type", type);
             AddTag(attributes, "exception.message", message);
             AddTag(attributes, "exception.stacktrace", stack);
         }
 
-        EmitLog(env, source, level, body, eventName: data.GetCustomProperty("eventId") ?? "exception",
-            attributes: _attributes.Filter(attributes));
+        EmitLogAndDerivedSpan(env, data, source, level, body,
+            eventName: data.GetCustomProperty("eventId") ?? "exception",
+            attributes: _attributes.Filter(attributes),
+            exception: new ExceptionInfo(type ?? "exception", message ?? body, stack));
     }
 
     private void MapUnsupported(Envelope env, JsonElement data, string baseType, TelemetrySource source)
@@ -151,10 +459,10 @@ public sealed class AiToOtelMapper
     }
 
     /// <summary>
-    /// Logs keep the original BC timestamp. Trace context is attached only when the
-    /// log belongs to a span (valid <c>ai.operation.parentId</c>): BC on-premises
-    /// reuses one <c>ai.operation.id</c> across sessions, which would otherwise glue
-    /// unrelated logs into one giant trace. The id is always kept as <c>bc.operation.id</c>.
+    /// Logs keep the original BC timestamp. They carry the trace of their operation
+    /// (<see cref="MappingOptions.CorrelateOperations"/>) and, when they belong to a
+    /// span (valid <c>ai.operation.parentId</c>), its span id. The id is always kept
+    /// as <c>bc.operation.id</c>.
     /// </summary>
     private void EmitLog(
         Envelope env,
@@ -165,7 +473,7 @@ public sealed class AiToOtelMapper
         IReadOnlyList<KeyValuePair<string, object?>> attributes)
     {
         var spanId = env.OperationId is null ? null : TraceContextMapper.ResolveParentSpanId(env.OperationParentId);
-        ActivityTraceId? traceId = spanId is null ? null : TraceContextMapper.ResolveTraceId(env.OperationId);
+        var traceId = spanId is null ? OperationTraceId(env) : TraceContextMapper.ResolveTraceId(env.OperationId);
 
         _emitter.EmitLog(new LogItem(source, env.TimestampUtc, level, body, eventName, traceId, spanId, attributes));
     }

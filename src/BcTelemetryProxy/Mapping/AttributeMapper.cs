@@ -119,7 +119,9 @@ public sealed class AttributeMapper
             return value == "True";
         }
 
-        var numeric = key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase) || NumericKeys.Contains(key);
+        var numeric = key.EndsWith("InMs", StringComparison.OrdinalIgnoreCase)
+            || key.EndsWith("Count", StringComparison.Ordinal)
+            || NumericKeys.Contains(key);
         if (!numeric)
         {
             return value;
@@ -145,6 +147,7 @@ public sealed class AttributeMapper
     {
         "sqlExecutes", "sqlRowsRead", "sqlStatementsExecuted", "totalRows", "rowsAffected",
         "httpStatusCode", "numberOfJoins", "numberOfRecords", "retryCount", "alStackDepth",
+        "attemptNumber", "alJobQueueNumberOfAttemptsToRun", "alJobQueueMaxNumberOfAttemptsToRun",
     };
 
     /// <summary>BC dimension -> exported key. Privacy rules match either name.</summary>

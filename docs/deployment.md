@@ -64,6 +64,8 @@ variables (`Section__Key`):
 | `Ingestion` | request size / count limits                                         |
 | `Telemetry` | attribute allow/deny/redact/hash lists                              |
 | `Debug`     | optional capture of raw envelopes / exported OTLP (troubleshooting) |
+| `Mapping`   | spans derived from BC events with a duration (APM)                  |
+| `HostTelemetry` | server metrics, BC counters/process, BC Event Log of this machine |
 
 ## 3. Point Business Central at the proxy
 
@@ -82,6 +84,21 @@ Restart-NAVServerInstance -ServerInstance $instance
 For multitenant instances use `Mount-NAVTenant -ApplicationInsightsConnectionString "..."`
 per tenant with the same URL; tenants are distinguished by the `bc.tenant.id` attribute.
 
+Run the proxy **on each BC server** to get that server's metrics, BC
+performance counters and Event Log as well (`HostTelemetry`, on by default).
+The app pool identity needs read access to performance counters and the event
+log: `Install-IISSite.ps1` adds it to *Performance Monitor Users* (S-1-5-32-558)
+and *Event Log Readers* (S-1-5-32-573), addressed by SID so localized Windows
+works too. Manually:
+
+```powershell
+Add-LocalGroupMember -SID "S-1-5-32-558" -Member "IIS AppPool\BcTelemetryProxy"
+Add-LocalGroupMember -SID "S-1-5-32-573" -Member "IIS AppPool\BcTelemetryProxy"
+```
+
+On a domain controller there are no local groups; use the domain's built-in
+groups of the same SID instead.
+
 ## 4. What arrives in GitLab
 
 - **Services:** `service.name` (default `business-central`), one
@@ -90,9 +107,65 @@ per tenant with the same URL; tenants are distinguished by the `bc.tenant.id` at
 - **Logs:** every BC signal (RT0005 long-running SQL, RT0018 long-running AL,
   LC* extension lifecycle, …) with `event.name` = BC event id, original timestamp,
   severity, and all custom dimensions; numeric `*InMs` companions for durations.
-- **Traces:** requests (server spans) and dependencies (client spans), correlated
-  with logs via trace id.
-- **Metrics:** BC metric telemetry as gauges.
+- **Traces:** one trace per BC operation (client action, web service call,
+  task) with all its events and logs; database events as client spans to `sql-server`.
+- **Metrics:** `bc.server.*` counters and `process.*` per instance, `system.*`
+  per host, `bcproxy.*` for the proxy itself, BC metric telemetry as gauges.
+- **APM:** BC events with a duration as spans (latency, throughput, errors per operation).
+- Dashboard and alert ideas: [`deploy/gitlab-o11y/`](../deploy/gitlab-o11y/).
+
+## 5. Database server (2-tier)
+
+The proxy runs on the BC server and finds the database server in each instance's
+`CustomSettings.config`. To monitor it without an agent, allow the proxy's identity
+(the IIS app pool runs as the BC server's computer account `DOMAIN\BCSERVER$` on the
+network) to read server state:
+
+```sql
+CREATE LOGIN [DOMAIN\BCSERVER$] FROM WINDOWS;
+GRANT VIEW SERVER STATE TO [DOMAIN\BCSERVER$];   -- SQL 2022: VIEW SERVER PERFORMANCE STATE
+```
+
+Further servers or SQL logins: `SqlMonitoring:Servers` (name -> connection string;
+keep passwords in environment variables, e.g. `SqlMonitoring__Servers__SQL01=...`).
+`GET /health` stays healthy if SQL is unreachable; the proxy logs one warning and
+reports `sqlserver.up = 0`.
+
+For CPU, disk and network of the database host in *Infrastructure*, run a second
+proxy there as a Windows service with only host telemetry (no BC points at it):
+
+```powershell
+sc.exe create BcTelemetryProxy binPath= "C:\bcproxy\BcTelemetryProxy.exe" start= auto
+setx /M Otlp__Endpoint https://<id>.otel.gitlab-o11y.com:14318
+setx /M SqlMonitoring__Enabled false   # the BC server's proxy already monitors SQL
+```
+
+Turn on BC's own database telemetry on every instance (off by default on-premises):
+
+```powershell
+Set-NAVServerConfiguration BC290 -KeyName EnableDeadlockMonitoring -KeyValue true
+Set-NAVServerConfiguration BC290 -KeyName EnableLockTimeoutMonitoring -KeyValue true
+# SqlLongRunningThresholdForApplicationInsights (ms) controls RT0005
+Restart-NAVServerInstance BC290
+```
+
+## 6. Finding errors and reporting them to the partner
+
+1. **See:** GitLab *Observe → Exceptions* groups errors by type (BC: `failureReason`,
+   lock timeout, deadlock; SQL Server: `SqlDeadlock`) with count and first / last
+   seen. Open one for the trace: everything the user's action caused.
+2. **Prioritise:** `GET /support/errors?hours=24` on the proxy lists error kinds
+   with affected users and sessions. Errors with `extensionPublisher` of a partner
+   app belong to that partner; `alObjectType = System` or Microsoft apps to the
+   CSP / Microsoft.
+3. **Report:** `GET /support/errors/<fingerprint>` gives a Markdown report with all
+   that support asks for (build, time UTC, operation / session id, message, AL
+   stack, SQL statement, deadlock graph). Attach it to the ticket. With
+   `Support:TraceUrlTemplate` the report links to the trace.
+4. **Be notified:** GitLab alert rules with a notification channel (e-mail /
+   webhook to the CSP's support address), e.g. logs `event.name = bc.error.first_seen`
+   (new error kind), `exception` count by type, `sqlserver.deadlock`, `sqlserver.up = 0`.
+   See [alerting ideas](../deploy/gitlab-o11y/README.md#alerting-ideas).
 
 ## Security model
 
@@ -105,6 +178,8 @@ per tenant with the same URL; tenants are distinguished by the `bc.tenant.id` at
 - **No instrumentation-key validation — by design.** The key is not a secret in
   this topology; sources are identified by URL path.
 - **Attribute privacy** — review the `Telemetry` allow/deny/redact/hash lists.
+- **Support reports** — `/support/*` answers local callers only
+  (`Support:LocalOnly`); reports contain error messages and SQL statements.
 
 ## Ingestion and export limits
 

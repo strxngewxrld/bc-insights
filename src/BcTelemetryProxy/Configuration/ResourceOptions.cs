@@ -22,6 +22,12 @@ public sealed class ResourceOptions
     public string? BcServerInstance { get; set; }
 
     /// <summary>
+    /// Extra resource attributes for every source, e.g. <c>gitlab.project.id</c>
+    /// (links telemetry to a GitLab project) or <c>service.version</c>.
+    /// </summary>
+    public Dictionary<string, string> Attributes { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// Per-source overrides keyed by <c>host/instance</c>, <c>instance</c> or
     /// <c>host</c> (case-insensitive, most specific match wins).
     /// </summary>
@@ -33,4 +39,7 @@ public sealed class SourceOverride
     public string? ServiceName { get; set; }
 
     public string? DeploymentEnvironment { get; set; }
+
+    /// <summary>Extra resource attributes for this source; merged over the global ones.</summary>
+    public Dictionary<string, string> Attributes { get; set; } = new(StringComparer.Ordinal);
 }

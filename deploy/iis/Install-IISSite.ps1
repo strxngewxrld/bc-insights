@@ -55,6 +55,18 @@ if (Test-Path "IIS:\Sites\$SiteName") {
 }
 New-Website -Name $SiteName -PhysicalPath $PhysicalPath -ApplicationPool $appPool -Port $Port | Out-Null
 
+# Host telemetry (server metrics, BC performance counters, BC Event Log) needs
+# read access; groups addressed by well-known SID so localized Windows works.
+foreach ($sid in "S-1-5-32-558", "S-1-5-32-573") { # Performance Monitor Users, Event Log Readers
+    try {
+        Add-LocalGroupMember -SID $sid -Member "IIS AppPool\$appPool" -ErrorAction Stop
+    } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
+        # Already a member.
+    } catch {
+        Write-Warning "Could not add IIS AppPool\$appPool to group $sid ($($_.Exception.Message)); host telemetry may be incomplete."
+    }
+}
+
 # Set the OTLP endpoint for the app pool environment.
 $env:Otlp__Endpoint = $OtlpEndpoint
 [Environment]::SetEnvironmentVariable("Otlp__Endpoint", $OtlpEndpoint, "Machine")

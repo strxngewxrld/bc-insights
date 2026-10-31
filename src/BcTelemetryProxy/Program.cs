@@ -1,11 +1,16 @@
 ﻿using BcTelemetryProxy.Configuration;
 using BcTelemetryProxy.Diagnostics;
 using BcTelemetryProxy.Export;
+using BcTelemetryProxy.HostTelemetry;
 using BcTelemetryProxy.Ingestion;
 using BcTelemetryProxy.Mapping;
+using BcTelemetryProxy.Support;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Runs under IIS, as a console app or as a Windows service (sc.exe create ...).
+builder.Host.UseWindowsService();
 
 // -- Options ----------------------------------------------------------------
 builder.Services.Configure<IngestionOptions>(builder.Configuration.GetSection(IngestionOptions.SectionName));
@@ -13,6 +18,10 @@ builder.Services.Configure<TelemetryPrivacyOptions>(builder.Configuration.GetSec
 builder.Services.Configure<ResourceOptions>(builder.Configuration.GetSection(ResourceOptions.SectionName));
 builder.Services.Configure<OtlpOptions>(builder.Configuration.GetSection(OtlpOptions.SectionName));
 builder.Services.Configure<DebugOptions>(builder.Configuration.GetSection(DebugOptions.SectionName));
+builder.Services.Configure<MappingOptions>(builder.Configuration.GetSection(MappingOptions.SectionName));
+builder.Services.Configure<HostTelemetryOptions>(builder.Configuration.GetSection(HostTelemetryOptions.SectionName));
+builder.Services.Configure<SqlMonitoringOptions>(builder.Configuration.GetSection(SqlMonitoringOptions.SectionName));
+builder.Services.Configure<SupportOptions>(builder.Configuration.GetSection(SupportOptions.SectionName));
 
 var ingestion = builder.Configuration.GetSection(IngestionOptions.SectionName).Get<IngestionOptions>() ?? new IngestionOptions();
 
@@ -32,12 +41,28 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<OtlpExporter>());
 
 // -- Translation pipeline ---------------------------------------------------
 builder.Services.AddSingleton<AttributeMapper>();
+builder.Services.AddSingleton(sp => BcInstanceCatalog.Discover(sp.GetRequiredService<ILogger<BcInstanceCatalog>>()));
+builder.Services.AddSingleton<ErrorRegistry>();
 builder.Services.AddSingleton<SourceResolver>();
 builder.Services.AddSingleton<AiToOtelMapper>();
+
+// -- Host telemetry (Windows) -------------------------------------------------
+// Server metrics, BC performance counters and BC event log of this machine;
+// each service checks HostTelemetry options itself and idles when disabled.
+if (OperatingSystem.IsWindows())
+{
+    builder.Services.AddHostedService<HostMetricsCollector>();
+    builder.Services.AddHostedService<EventLogForwarder>();
+}
+
+// -- Database tier ------------------------------------------------------------
+// Agentless SQL Server monitoring of the BC databases (also remote, 2-tier).
+builder.Services.AddHostedService<SqlServerMonitor>();
 
 var app = builder.Build();
 
 app.MapAppInsightsIngestion();
+app.MapSupport();
 
 app.Run();
 

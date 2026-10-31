@@ -17,6 +17,6 @@ internal static class TestFactory
     public static AttributeMapper AttributeMapper(TelemetryPrivacyOptions? privacy = null)
         => new(Options.Create(privacy ?? new TelemetryPrivacyOptions()));
 
-    public static AiToOtelMapper Mapper(IOtelEmitter emitter, TelemetryPrivacyOptions? privacy = null)
-        => new(emitter, AttributeMapper(privacy), NullLogger<AiToOtelMapper>.Instance);
+    public static AiToOtelMapper Mapper(IOtelEmitter emitter, TelemetryPrivacyOptions? privacy = null, MappingOptions? mapping = null, Support.ErrorRegistry? errors = null)
+        => new(emitter, AttributeMapper(privacy), NullLogger<AiToOtelMapper>.Instance, Options.Create(mapping ?? new MappingOptions()), errors);
 }

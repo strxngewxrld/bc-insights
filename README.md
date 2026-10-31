@@ -21,13 +21,18 @@ BcTelemetryProxy  (ASP.NET Core, IIS in-process)
    • filters / redacts / hashes attributes before export
    • bounded queue → batched OTLP/HTTP JSON (gzip), retry + backoff,
      503 backpressure to BC when the queue is full
+   • on Windows also collects its own machine: system.* metrics, BC performance
+     counters and process metrics per instance, BC Event Log → logs
           ▼
 GitLab Observability (or any OTLP/HTTP endpoint, optionally via a Collector)
 ```
 
-No Collector is required. A Collector remains an option when you also want to
-ship Windows Event Logs or fan out to several backends
-([`deploy/otel-collector/`](deploy/otel-collector/)); point `Otlp:Endpoint` at it.
+No Collector is required: the proxy also covers server metrics and the BC
+Event Log. A Collector ([`deploy/otel-collector/`](deploy/otel-collector/))
+remains an option to fan out to several backends; point `Otlp:Endpoint` at it.
+
+What this gives you in GitLab Observability (APM views, dashboard, alert ideas):
+[`deploy/gitlab-o11y/`](deploy/gitlab-o11y/).
 
 ## Sources: several instances and servers
 
@@ -66,6 +71,7 @@ Tenant, company and environment are **record attributes** (`bc.tenant.id`,
 | `MessageData`          | Log         | `severityLevel` (name or number)→severity, `message`→body, `eventId`→`event.name` |
 | `EventData`            | Log (Info)  | `name`→body                                                  |
 | `ExceptionData`        | Log (Error) | `exception.type` / `.message` / `.stacktrace`                |
+| `MessageData` with a duration | + Span | sign-in, SQL (client, `db.system.name`), AL, web service (client), report … → APM |
 | `RequestData`          | Span/Server | duration, `http.response.status_code`, `url.full`, status    |
 | `RemoteDependencyData` | Span/Client | `bc.dependency.type` / `.target` / `.data` / `.result_code`  |
 | `MetricData`           | Gauge       | value at original time; `bc.metric.count/min/max/stddev`     |
@@ -89,13 +95,68 @@ Tenant, company and environment are **record attributes** (`bc.tenant.id`,
 - **Placeholders dropped:** BC's `"N/A"` (tags) and `"NaN"` (dimensions) are
   treated as missing.
 
+### Host telemetry (Windows, `HostTelemetry`)
+
+The proxy samples the machine it runs on every `IntervalSeconds` (60):
+
+| Metrics                | Resource                 | Content                                                       |
+| ---------------------- | ------------------------ | ------------------------------------------------------------- |
+| `system.*`             | `<host>`                 | CPU (`utilization`, `time` per mode), memory, file systems, disk utilization / queue / throughput, network, uptime |
+| `bc.server.*`          | `<host>/<instance>`      | every counter of `Microsoft Dynamics NAV(<instance>)`: sessions, operations/s, operation time, SQL connections, caches, tasks, throttling, … |
+| `process.*`            | `<host>/<instance>`      | BC server process memory, CPU time, threads, handles          |
+| `bcproxy.*`            | `<host>`                 | export queue length, exported / failed / dropped / rejected items, degraded flag |
+
+New Event Log entries of `EventLogChannels` (default: the BC server Admin
+channel, warnings and errors) become logs on the instance they name.
+
+### Database tier (`SqlMonitoring`)
+
+The proxy reads each local BC instance's `CustomSettings.config`
+(`DatabaseServer`, `DatabaseInstance`, `DatabaseName`). The instance's resource
+gets `bc.database.server` / `bc.database.name`, and database events (RT0005 long
+running SQL, RT0012 lock timeout, RT0028 deadlock) become client spans to
+`peer.service = sql-server` with `server.address` and `db.namespace`.
+
+Without an agent on the database server, the proxy also queries the SQL Server's
+dynamic management views (works for a remote server in a 2-tier setup). The data
+goes to resource `service.name = sql-server`, `service.instance.id = <host>/<sqlInstance>`:
+
+| Signal | Content |
+| ------ | ------- |
+| `sqlserver.*` metrics | reachable (`up`), batch requests, connections, blocked processes, page life expectancy, buffer cache hit ratio, lock waits / timeouts / deadlocks, waits by category, file I/O and stall per database (data/log), transaction log size / used, memory, CPU and memory of the database host |
+| `sqlserver.blocking` logs | each request blocked ≥ `BlockingThresholdSeconds` (10), logged once: both session ids, wait type / resource, both statements, client app and host |
+| `sqlserver.deadlock` span + log | each deadlock from the `system_health` session: failed span with `exception` event (`SqlDeadlock`), victim and other statements, deadlock graph |
+
+The proxy's identity needs `VIEW SERVER STATE` (SQL Server 2022:
+`VIEW SERVER PERFORMANCE STATE`), see [deployment](docs/deployment.md#5-database-server-2-tier).
+
+### Errors and support reports (`Support`)
+
+Every error (failed BC event, SQL deadlock) gets `bc.error.fingerprint`: event,
+type, AL object, extension and message without ids/numbers. The first time a
+fingerprint occurs, the proxy logs `bc.error.first_seen` (for a "new error" alert).
+The proxy keeps counts, affected users / sessions and the latest samples in memory:
+
+- `GET /support/errors?hours=24` lists error kinds, most affected users first.
+- `GET /support/errors/<fingerprint>` returns a Markdown report for the partner (CSP)
+  or Microsoft: BC build, instances, counts, first / last seen, message, AL stack
+  trace, AL object, extension and publisher, SQL statement, operation, session and
+  trace ids. Local callers only by default (`Support:LocalOnly`).
+
 ### Trace context
 
 `ai.operation.id` becomes the trace id (see `Mapping/TraceContextMapper.cs`): a
-valid 32-hex W3C id is used unchanged; any other id is deterministically hashed
-(SHA-256, first 16 bytes); a missing id yields a random trace id for spans and no
-trace context for logs. A valid `ai.operation.parentId` is preserved as parent;
-otherwise the span is a root span. A request's own 16-hex `id` becomes its span id.
+valid 32-hex W3C id is used unchanged, a GUID as its 32 hex digits, any other id
+is deterministically hashed (SHA-256, first 16 bytes); a missing id yields a random
+trace id for spans and no trace context for logs. A valid `ai.operation.parentId`
+is preserved as parent; otherwise the span is a root span. A request's own 16-hex
+`id` becomes its span id.
+
+BC on-premises sets one `ai.operation.id` per client action (a click in the web
+client, a web service call, a task) and keeps it within the session
+(`ai.session.id`, exported as `bc.session.id`). With `Mapping:CorrelateOperations`
+(default on), all spans and logs of one action share its trace: sign-in, AL, long
+SQL statements, lock timeouts and the error dialog appear together in one trace.
 
 ## Hardening at a glance
 
@@ -125,13 +186,17 @@ otherwise the span is a root span. A request's own 16-hex `id` becomes its span 
 src/BcTelemetryProxy/
   Configuration/  options (Ingestion, Otlp, Resource, Telemetry)
   Diagnostics/    DebugCapture (optional raw/OTLP capture)
+  HostTelemetry/  Windows metrics, BC counters/process, Event Log forwarder,
+                  BC instance catalog, SQL Server monitoring
   Ingestion/      endpoints, envelope reader, limits, SourceResolver
   Mapping/        AiToOtelMapper + TraceContextMapper + AttributeMapper + MetricMapper
   Export/         OtlpExporter (queue, batching, retry) + OtlpJsonSerializer
   Model/          AI envelope + translated telemetry items
+  Support/        error registry (fingerprints) + /support/errors reports
 tests/BcTelemetryProxy.Tests/   xUnit unit + integration tests
 deploy/iis/                     IIS publish/host script
-deploy/otel-collector/          optional Collector (Windows Event Log, fan-out)
+deploy/gitlab-o11y/             GitLab Observability dashboard + guide
+deploy/otel-collector/          optional Collector (fan-out to several backends)
 samples/                        example /v2/track payload + real (sanitised) BC 29 envelope
 ```
 

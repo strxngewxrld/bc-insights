@@ -66,6 +66,19 @@ public class SourceResolverTests
         Assert.Equal("production", resolver.Resolve("SRV01", "BC250", empty, null).DeploymentEnvironment);
     }
 
+    [Fact]
+    public void Empty_configured_values_count_as_unset()
+    {
+        // appsettings "HostName": null binds as "".
+        var resolver = Resolver(new ResourceOptions { HostName = "", BcServerInstance = "" });
+
+        var source = resolver.Resolve(null, null, TestFactory.ParseEnvelope("{}"), IPAddress.Parse("10.1.2.3"));
+
+        Assert.Equal("10.1.2.3", source.HostName);
+        Assert.Null(source.ServerInstance);
+        Assert.Equal(Environment.MachineName, resolver.Local("BC290").HostName);
+    }
+
     [Theory]
     [InlineData("SRV-01.corp_x", true)]
     [InlineData("", false)]
@@ -203,6 +216,82 @@ public class OtlpJsonSerializerTests
         Assert.Equal("abcdef0123456789", s.GetProperty("parentSpanId").GetString());
         Assert.Equal("1783670400005000000", s.GetProperty("endTimeUnixNano").GetString());
         Assert.Equal(2, s.GetProperty("status").GetProperty("code").GetInt32());
+    }
+
+    [Fact]
+    public void Span_events_and_service_version_are_serialized()
+    {
+        var source = Srv1 with { ServiceVersion = "29.0.55365.0" };
+        var at = new DateTime(2026, 7, 10, 8, 0, 0, DateTimeKind.Utc);
+        var span = new SpanItem(source, "Error dialog shown: MetadataNotFound", ActivityKind.Internal, at, TimeSpan.Zero,
+            ActivityTraceId.CreateRandom(), ActivitySpanId.CreateRandom(), null, Success: false, "MetadataNotFound",
+            Array.Empty<KeyValuePair<string, object?>>(),
+            new[] { new SpanEvent("exception", at, new KeyValuePair<string, object?>[] { new("exception.type", "MetadataNotFound") }) });
+
+        using var doc = Write(w => OtlpJsonSerializer.WriteSpans(w, new[] { span }));
+
+        var resource = doc.RootElement.GetProperty("resourceSpans")[0];
+        Assert.Equal("29.0.55365.0", Attributes(resource.GetProperty("resource"))["service.version"].GetProperty("stringValue").GetString());
+        var e = resource.GetProperty("scopeSpans")[0].GetProperty("spans")[0].GetProperty("events")[0];
+        Assert.Equal("exception", e.GetProperty("name").GetString());
+        Assert.Equal("1783670400000000000", e.GetProperty("timeUnixNano").GetString());
+        Assert.Equal("MetadataNotFound", Attributes(e)["exception.type"].GetProperty("stringValue").GetString());
+    }
+
+    [Fact]
+    public void Cumulative_counters_are_sums_and_gauges_keep_their_unit()
+    {
+        var at = new DateTime(2026, 7, 10, 8, 0, 0, DateTimeKind.Utc);
+        var sum = new MetricItem(Srv1, at, new AiMetricPoint("system.network.io", 1000, null, null, null, null), MetricKind.Counter,
+            new KeyValuePair<string, object?>[] { new("network.io.direction", "receive") }, "By", at.AddHours(-1));
+        var gauge = new MetricItem(Srv1, at, new AiMetricPoint("system.cpu.utilization", 0.25, null, null, null, null), MetricKind.Gauge,
+            Array.Empty<KeyValuePair<string, object?>>(), "1");
+
+        using var doc = Write(w => OtlpJsonSerializer.WriteMetrics(w, new[] { sum, gauge }));
+
+        var metrics = doc.RootElement.GetProperty("resourceMetrics")[0].GetProperty("scopeMetrics")[0].GetProperty("metrics");
+        var network = metrics[0];
+        Assert.Equal("By", network.GetProperty("unit").GetString());
+        Assert.Equal(2, network.GetProperty("sum").GetProperty("aggregationTemporality").GetInt32());
+        Assert.True(network.GetProperty("sum").GetProperty("isMonotonic").GetBoolean());
+        Assert.Equal("1783666800000000000", network.GetProperty("sum").GetProperty("dataPoints")[0].GetProperty("startTimeUnixNano").GetString());
+        Assert.Equal(0.25, metrics[1].GetProperty("gauge").GetProperty("dataPoints")[0].GetProperty("asDouble").GetDouble());
+    }
+
+    [Fact]
+    public void Up_down_counters_are_non_monotonic_cumulative_sums()
+    {
+        var at = new DateTime(2026, 7, 10, 8, 0, 0, DateTimeKind.Utc);
+        var memory = new MetricItem(Srv1, at, new AiMetricPoint("system.memory.usage", 1024, null, null, null, null), MetricKind.UpDownCounter,
+            new KeyValuePair<string, object?>[] { new("state", "used") }, "By", at.AddHours(-1));
+
+        using var doc = Write(w => OtlpJsonSerializer.WriteMetrics(w, new[] { memory }));
+
+        var sum = doc.RootElement.GetProperty("resourceMetrics")[0].GetProperty("scopeMetrics")[0].GetProperty("metrics")[0].GetProperty("sum");
+        Assert.Equal(2, sum.GetProperty("aggregationTemporality").GetInt32());
+        Assert.False(sum.GetProperty("isMonotonic").GetBoolean());
+    }
+
+    [Fact]
+    public void Configured_resource_attributes_are_added_without_overriding_standard_ones()
+    {
+        var resolver = new SourceResolver(Options.Create(new ResourceOptions
+        {
+            Attributes = { ["gitlab.project.id"] = "42", ["service.name"] = "ignored" },
+            Sources = { ["SRV01/BC290"] = new SourceOverride { Attributes = { ["gitlab.project.id"] = "43" } } },
+        }));
+        var empty = TestFactory.ParseEnvelope("{}");
+        var a = resolver.Resolve("SRV01", "BC290", empty, null);
+        var b = resolver.Resolve("SRV01", "BC290", empty, null);
+        Assert.Equal(a, b);
+
+        using var doc = Write(w => OtlpJsonSerializer.WriteLogs(w, new[] { Log(a, "x"), Log(resolver.Resolve("SRV02", "BC290", empty, null), "y") }, DateTime.UtcNow));
+
+        var resources = doc.RootElement.GetProperty("resourceLogs");
+        var first = Attributes(resources[0].GetProperty("resource"));
+        Assert.Equal("43", first["gitlab.project.id"].GetProperty("stringValue").GetString());
+        Assert.Equal("business-central", first["service.name"].GetProperty("stringValue").GetString());
+        Assert.Equal("42", Attributes(resources[1].GetProperty("resource"))["gitlab.project.id"].GetProperty("stringValue").GetString());
     }
 
     private static Dictionary<string, JsonElement> Attributes(JsonElement owner)

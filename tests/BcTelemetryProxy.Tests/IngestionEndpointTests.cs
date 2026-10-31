@@ -13,14 +13,14 @@ namespace BcTelemetryProxy.Tests;
 /// the real ASP.NET Core host (translation runs; OTLP export happens in the
 /// background and is not asserted here).
 /// </summary>
-public class IngestionEndpointTests : IClassFixture<WebApplicationFactory<Program>>
+public class IngestionEndpointTests : IClassFixture<ProxyFactory>
 {
     private const string Message = """{"name":"Microsoft.ApplicationInsights.Message","time":"2026-07-10T08:15:30Z","tags":{"ai.operation.id":"0123456789abcdef0123456789abcdef"},"data":{"baseType":"MessageData","baseData":{"message":"hello","severityLevel":1,"properties":{"eventId":"RT0005"}}}}""";
     private const string Request = """{"name":"Microsoft.ApplicationInsights.Request","time":"2026-07-10T08:15:31Z","tags":{"ai.operation.id":"0123456789abcdef0123456789abcdef"},"data":{"baseType":"RequestData","baseData":{"name":"OpenPage","duration":"00:00:00.4560000","responseCode":"200","success":true}}}""";
 
     private readonly WebApplicationFactory<Program> _factory;
 
-    public IngestionEndpointTests(WebApplicationFactory<Program> factory) => _factory = factory;
+    public IngestionEndpointTests(ProxyFactory factory) => _factory = factory;
 
     [Fact]
     public async Task Track_accepts_gzip_ndjson_and_returns_ai_summary()
@@ -109,5 +109,25 @@ public class IngestionEndpointTests : IClassFixture<WebApplicationFactory<Progra
         var response = await _factory.CreateClient().PostAsync("/SRV%2001/BC290/v2/track", content);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Support_endpoint_lists_errors_and_writes_a_report()
+    {
+        const string error = """{"time":"2026-10-31T08:00:00Z","tags":{"ai.operation.id":"c6727c47-6c2e-c821-fcd9-4cc475d05415"},"data":{"baseType":"MessageData","baseData":{"message":"Error dialog shown: SupportTest","severityLevel":"Error","properties":{"eventId":"RT0030","failureReason":"SupportTest","alErrorMessage":"Something failed."}}}}""";
+        using var content = new StringContent(error, Encoding.UTF8);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/x-json-stream");
+        var client = _factory.CreateClient();
+        await client.PostAsync("/SRV01/BC290/v2/track", content);
+
+        using var list = JsonDocument.Parse(await client.GetStringAsync("/support/errors?hours=876000"));
+        var entry = list.RootElement.EnumerateArray().Single(e => e.GetProperty("type").GetString() == "SupportTest");
+        var report = await client.GetAsync(entry.GetProperty("report").GetString());
+
+        Assert.Equal("text/markdown", report.Content.Headers.ContentType?.MediaType);
+        var text = await report.Content.ReadAsStringAsync();
+        Assert.Contains("Something failed.", text);
+        Assert.Contains("SRV01/BC290", text);
+        Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/support/errors/000000000000")).StatusCode);
     }
 }

@@ -22,6 +22,9 @@ public enum MetricKind
 
     /// <summary>Pre-aggregated distribution (count/min/max/stddev present).</summary>
     Histogram,
+
+    /// <summary>Current amount that can go up and down (e.g. memory in use); exported as a non-monotonic cumulative sum.</summary>
+    UpDownCounter,
 }
 
 /// <summary>Parses and classifies AI metric points into an OTLP-friendly shape.</summary>

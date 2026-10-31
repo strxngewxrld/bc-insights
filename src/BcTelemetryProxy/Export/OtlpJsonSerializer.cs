@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
+using BcTelemetryProxy.Mapping;
 using BcTelemetryProxy.Model;
 using BcTelemetryProxy.Telemetry;
 using Microsoft.Extensions.Logging;
@@ -109,6 +110,21 @@ public static class OtlpJsonSerializer
                 w.WriteString("startTimeUnixNano", UnixNanos(span.StartUtc));
                 w.WriteString("endTimeUnixNano", UnixNanos(span.StartUtc + span.Duration));
                 WriteAttributes(w, span.Attributes);
+                if (span.Events is { Count: > 0 } events)
+                {
+                    w.WriteStartArray("events");
+                    foreach (var e in events)
+                    {
+                        w.WriteStartObject();
+                        w.WriteString("timeUnixNano", UnixNanos(e.TimeUtc));
+                        w.WriteString("name", e.Name);
+                        WriteAttributes(w, e.Attributes);
+                        w.WriteEndObject();
+                    }
+
+                    w.WriteEndArray();
+                }
+
                 w.WriteStartObject("status");
                 if (span.Success)
                 {
@@ -157,13 +173,31 @@ public static class OtlpJsonSerializer
             w.WriteStartArray("metrics");
             foreach (var metric in group.GroupBy(m => m.Point.Name, StringComparer.Ordinal))
             {
+                var first = metric.First();
+                var cumulative = first is { Kind: MetricKind.Counter or MetricKind.UpDownCounter, StartUtc: not null };
+
                 w.WriteStartObject();
                 w.WriteString("name", metric.Key);
-                w.WriteStartObject("gauge");
+                if (first.Description is not null)
+                {
+                    w.WriteString("description", first.Description);
+                }
+
+                if (first.Unit is not null)
+                {
+                    w.WriteString("unit", first.Unit);
+                }
+
+                w.WriteStartObject(cumulative ? "sum" : "gauge");
                 w.WriteStartArray("dataPoints");
                 foreach (var point in metric)
                 {
                     w.WriteStartObject();
+                    if (cumulative && point.StartUtc is { } start)
+                    {
+                        w.WriteString("startTimeUnixNano", UnixNanos(start));
+                    }
+
                     w.WriteString("timeUnixNano", UnixNanos(point.TimeUtc));
                     w.WriteNumber("asDouble", point.Point.Value);
                     WriteAttributes(w, point.Attributes);
@@ -171,6 +205,12 @@ public static class OtlpJsonSerializer
                 }
 
                 w.WriteEndArray();
+                if (cumulative)
+                {
+                    w.WriteNumber("aggregationTemporality", 2); // CUMULATIVE
+                    w.WriteBoolean("isMonotonic", first.Kind == MetricKind.Counter);
+                }
+
                 w.WriteEndObject();
                 w.WriteEndObject();
             }
@@ -192,8 +232,10 @@ public static class OtlpJsonSerializer
             new("service.name", source.ServiceName),
             new("service.namespace", source.ServiceNamespace),
             new("service.instance.id", source.ServiceInstanceId),
+            new("service.version", source.ServiceVersion),
             new("host.name", source.HostName),
             new("bc.server_instance", source.ServerInstance),
+            new("os.type", "windows"), // Business Central servers run on Windows only
             // Current semantic convention plus the legacy key many UIs
             // (incl. GitLab Observability) still filter on.
             new("deployment.environment.name", source.DeploymentEnvironment),
@@ -202,6 +244,14 @@ public static class OtlpJsonSerializer
             new("telemetry.sdk.language", "dotnet"),
             new("telemetry.sdk.version", ScopeVersion),
         };
+
+        foreach (var (key, value) in source.Attributes)
+        {
+            if (!attributes.Exists(a => a.Key == key))
+            {
+                attributes.Add(new(key, value));
+            }
+        }
 
         w.WriteStartObject("resource");
         WriteAttributes(w, attributes);

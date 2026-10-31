@@ -1,8 +1,9 @@
 # OpenTelemetry Collector configuration for the Business Central telemetry proxy.
 #
-# OPTIONAL. The proxy exports directly to the backend by default. Use this
-# Collector only to add Windows Event Logs or fan out to several backends; then
-# point the proxy's Otlp:Endpoint at http://localhost:4318.
+# OPTIONAL. The proxy exports directly to the backend and collects server
+# metrics and the BC Event Log itself (HostTelemetry). Use this Collector only to
+# fan out to several backends or to read further Event Log channels; then point
+# the proxy's Otlp:Endpoint at http://localhost:4318.
 #
 # It receives translated telemetry from the proxy over OTLP, reads selected
 # Windows Event Log providers, and forwards everything to an OTLP-capable
